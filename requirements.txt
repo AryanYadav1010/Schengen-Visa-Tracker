@@ -1,0 +1,17 @@
+fastapi>=0.115
+uvicorn[standard]>=0.30
+sqlalchemy>=2.0
+aiosqlite>=0.20
+pydantic-settings>=2.5
+playwright>=1.48
+apscheduler>=3.10
+httpx>=0.27
+jinja2>=3.1
+python-multipart>=0.0.12
+browser-use>=0.13
+anthropic>=0.76
+cryptography>=43.0
+itsdangerous>=2.2
+google-auth>=2.34
+google-auth-oauthlib>=1.2
+google-api-python-client>=2.149

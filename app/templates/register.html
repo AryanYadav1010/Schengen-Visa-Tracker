@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Register — Schengen Appointment Tracker</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <div class="container" style="max-width: 420px; margin-top: 4rem;">
+        <header style="margin-bottom: 1.5rem;">
+            <div class="brand">
+                <h1>🔭 Schengen Tracker</h1>
+                <p>Create your account.</p>
+            </div>
+        </header>
+
+        <div class="settings-card">
+            {% if error %}
+            <div class="form-group" style="margin-bottom: 1rem;">
+                <span style="color: var(--danger); font-size: 0.875rem; font-weight: 600;">{{ error }}</span>
+            </div>
+            {% endif %}
+            <form method="post" action="/register">
+                <div class="form-group" style="margin-bottom: 1rem;">
+                    <label for="email">Email</label>
+                    <input type="email" id="email" name="email" class="form-input" required autofocus>
+                </div>
+                <div class="form-group" style="margin-bottom: 1.5rem;">
+                    <label for="password">Password</label>
+                    <input type="password" id="password" name="password" class="form-input" minlength="8" required>
+                </div>
+                <button type="submit" class="btn btn-primary" style="width: 100%;">Register</button>
+            </form>
+        </div>
+
+        <p style="text-align: center; color: var(--text-muted); font-size: 0.875rem;">
+            Already have an account? <a href="/login">Log in</a>
+        </p>
+    </div>
+</body>
+</html>

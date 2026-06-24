@@ -1,0 +1,791 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Schengen Appointment Tracker</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <div class="container">
+        <!-- Header -->
+        <header>
+            <div class="brand">
+                <h1>🔭 Schengen Appointment Tracker</h1>
+                <p>Monitor visa slots in real-time. Get emailed instantly when availability opens.</p>
+            </div>
+            
+            <div class="action-bar">
+                <span id="mock-badge" class="badge-mode {% if settings.USE_MOCK_SCRAPER %}mock{% else %}normal{% endif %}">
+                    {% if settings.USE_MOCK_SCRAPER %}Mock Mode{% else %}Live Mode{% endif %}
+                </span>
+                <button id="btn-check-all" class="btn btn-primary" onclick="checkAll()">⚡ Check Now</button>
+                <button id="btn-test-email" class="btn btn-outline" onclick="sendTestEmail()">📧 Test Email</button>
+                <span style="color: var(--text-muted); font-size: 0.875rem;">{{ user.email }}</span>
+                <form method="post" action="/logout" style="display:inline;">
+                    <button type="submit" class="btn btn-outline">Log Out</button>
+                </form>
+            </div>
+        </header>
+
+        <!-- Visa Type Tabs (Visual Filter) -->
+        <div class="tabs">
+            <button class="tab active" onclick="filterVisaType('all', this)">🌍 All Types</button>
+            <button class="tab" onclick="filterVisaType('tourism', this)">🏖️ Tourism</button>
+            <button class="tab" onclick="filterVisaType('business', this)">💼 Business</button>
+            <button class="tab" onclick="filterVisaType('long_stay', this)">🏡 Long Stay</button>
+        </div>
+
+        <!-- Main Data Card -->
+        <div class="card">
+            <div class="table-wrapper">
+                <table>
+                    <thead>
+                        <tr>
+                            <th class="destination-sticky">Destination &amp; Centre</th>
+                            <th>Earliest Available</th>
+                            <th>{{ current_months[0] }}</th>
+                            <th>{{ current_months[1] }}</th>
+                            <th>{{ current_months[2] }}</th>
+                            <th>Monitor &amp; Run</th>
+                        </tr>
+                    </thead>
+                    <tbody id="table-body">
+                        {% for watch in watches %}
+                        {% set snapshot = snapshots.get(watch.id|string) or snapshots.get(watch.id) %}
+                        <tr data-watch-id="{{ watch.id }}" data-visa-type="{{ watch.visa_type }}">
+                            <td class="destination-sticky">
+                                <div class="destination-cell">
+                                    <span>{{ watch.flag_emoji }}</span>
+                                    <div>
+                                        <strong>{{ watch.destination }}</strong>
+                                        <div style="font-size: 0.75rem; color: var(--text-muted);">
+                                            {{ watch.centre }} ({{ watch.provider }})
+                                        </div>
+                                    </div>
+                                    <span class="visa-type-tag">{{ watch.visa_type.replace('_', ' ') }}</span>
+                                </div>
+                            </td>
+                            
+                            <!-- Earliest date -->
+                            <td>
+                                <div class="earliest-container">
+                                    {% if snapshot %}
+                                        {% if snapshot.is_error %}
+                                            <span class="earliest-cell blocked" title="{{ snapshot.error_message or 'Scraper blocked or failed' }}">⚠️ Blocked</span>
+                                        {% elif snapshot.earliest_date %}
+                                            <span class="earliest-cell available">{{ snapshot.earliest_date }}</span>
+                                        {% else %}
+                                            <span class="earliest-cell unavailable">No slots</span>
+                                        {% endif %}
+                                    {% else %}
+                                        <span class="earliest-cell pending">Pending...</span>
+                                    {% endif %}
+                                    
+                                    <span class="last-checked" data-time="{% if snapshot %}{{ snapshot.checked_at }}{% elif watch.last_checked_at %}{{ watch.last_checked_at }}{% endif %}">
+                                        Last checked: {% if snapshot or watch.last_checked_at %}calculating...{% else %}never{% endif %}
+                                    </span>
+                                    <span class="last-checked alert-before-label" data-watch-id="{{ watch.id }}" style="cursor: pointer;" onclick="editAlertBeforeDate({{ watch.id }}, this)" title="Click to set/change the date cutoff for alerts">
+                                        {% if watch.alert_before_date %}🔔 Alert only before {{ watch.alert_before_date }}{% else %}🔔 Alert on any improvement{% endif %}
+                                    </span>
+                                </div>
+                            </td>
+
+                            <!-- Month 1 slots -->
+                            <td class="month-cell" data-month-index="0" data-slots='{% if snapshot %}{{ snapshot.slots_json }}{% endif %}'>
+                                —
+                            </td>
+
+                            <!-- Month 2 slots -->
+                            <td class="month-cell" data-month-index="1" data-slots='{% if snapshot %}{{ snapshot.slots_json }}{% endif %}'>
+                                —
+                            </td>
+
+                            <!-- Month 3 slots -->
+                            <td class="month-cell" data-month-index="2" data-slots='{% if snapshot %}{{ snapshot.slots_json }}{% endif %}'>
+                                —
+                            </td>
+
+                            <!-- Monitor switch & manual triggers -->
+                            <td>
+                                <div class="action-cell">
+                                    <label class="switch">
+                                        <input type="checkbox" id="toggle-{{ watch.id }}" {% if watch.enabled %}checked{% endif %} onchange="toggleWatch({{ watch.id }}, this)">
+                                        <span class="slider"></span>
+                                    </label>
+                                    <button class="btn-icon" title="Check this watch now" onclick="checkWatch({{ watch.id }}, this)">
+                                        ↻
+                                    </button>
+                                    <button class="btn-icon" title="Delete this watch" onclick="deleteWatch({{ watch.id }}, this)">
+                                        🗑️
+                                    </button>
+                                </div>
+                            </td>
+                        </tr>
+                        {% endfor %}
+                        {% if not watches %}
+                        <tr><td colspan="6" style="text-align:center; color: var(--text-muted);">No watches yet — add one below.</td></tr>
+                        {% endif %}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+        <!-- Add Watch -->
+        <div class="settings-section">
+            <div class="settings-header">
+                <h2>➕ Add a Watch</h2>
+            </div>
+            <div class="settings-card">
+                <form id="add-watch-form" onsubmit="addWatch(event)">
+                    <div class="settings-grid">
+                        <div class="form-group">
+                            <label for="aw_centre">Centre</label>
+                            <input type="text" id="aw_centre" class="form-input" placeholder="London" required>
+                        </div>
+                        <div class="form-group">
+                            <label for="aw_destination">Destination</label>
+                            <input type="text" id="aw_destination" class="form-input" placeholder="France" required>
+                        </div>
+                        <div class="form-group">
+                            <label for="aw_visa_type">Visa Type</label>
+                            <select id="aw_visa_type" class="form-input" required>
+                                <option value="tourism">Tourism</option>
+                                <option value="business">Business</option>
+                                <option value="long_stay">Long Stay</option>
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <label for="aw_provider">Provider</label>
+                            <select id="aw_provider" class="form-input" required>
+                                {% for p in providers %}
+                                <option value="{{ p }}">{{ p }}</option>
+                                {% endfor %}
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <label for="aw_booking_url">Booking URL (optional)</label>
+                            <input type="url" id="aw_booking_url" class="form-input" placeholder="https://...">
+                        </div>
+                        <div class="form-group">
+                            <label for="aw_alert_before_date">Alert me only if before (optional)</label>
+                            <input type="date" id="aw_alert_before_date" class="form-input">
+                        </div>
+                    </div>
+                    <button type="submit" class="btn btn-primary">Add Watch</button>
+                </form>
+            </div>
+        </div>
+
+        <!-- Provider Credentials -->
+        <div class="settings-section">
+            <div class="settings-header">
+                <h2>🔐 Provider Credentials</h2>
+            </div>
+            <div class="settings-card">
+                <p style="color: var(--text-muted); font-size: 0.825rem; margin-bottom: 1rem;">
+                    Stored encrypted. Required only when running real (non-mock) scrapers.
+                </p>
+                {% for p in providers %}
+                <form class="cred-form" onsubmit="saveCredential(event, '{{ p }}')" style="margin-bottom: 1rem;">
+                    <div class="settings-grid">
+                        <div class="form-group">
+                            <label>{{ p }} email {% if p in configured_providers %}<span style="color: var(--success);">(configured)</span>{% endif %}</label>
+                            <input type="email" id="cred_email_{{ p }}" class="form-input" placeholder="account email">
+                        </div>
+                        <div class="form-group">
+                            <label>{{ p }} password</label>
+                            <input type="password" id="cred_password_{{ p }}" class="form-input" placeholder="••••••••">
+                        </div>
+                    </div>
+                    <button type="submit" class="btn btn-outline">Save {{ p }} credentials</button>
+                </form>
+                {% endfor %}
+            </div>
+        </div>
+
+        <!-- Email Delivery (Gmail OAuth) -->
+        <div class="settings-section">
+            <div class="settings-header">
+                <h2>📧 Email Delivery</h2>
+            </div>
+            <div class="settings-card">
+                {% if not google_oauth_configured %}
+                <p style="color: var(--text-muted); font-size: 0.825rem;">
+                    Google sign-in isn't configured on this server. Alerts send via the operator's shared email account.
+                </p>
+                {% elif google_linked %}
+                <p style="color: var(--success); font-weight: 600; margin-bottom: 0.5rem;">✅ Connected as {{ google_email }}</p>
+                <p style="color: var(--text-muted); font-size: 0.825rem; margin-bottom: 1rem;">
+                    Your alerts send from your own Gmail account.
+                </p>
+                <button class="btn btn-outline" onclick="unlinkGoogle()">Disconnect Gmail</button>
+                {% else %}
+                <p style="color: var(--text-muted); font-size: 0.825rem; margin-bottom: 1rem;">
+                    Not connected — alerts currently send via the operator's shared email account.
+                    Connect your own Gmail so alerts send from your own address instead, with no password ever shared with this app.
+                </p>
+                <a href="/oauth/google/start" class="btn btn-primary">Connect Gmail</a>
+                {% endif %}
+            </div>
+        </div>
+
+        <!-- Telegram Alerts -->
+        <div class="settings-section">
+            <div class="settings-header">
+                <h2>📱 Telegram Alerts</h2>
+            </div>
+            <div class="settings-card" id="telegram-card">
+                {% if not telegram_configured %}
+                <p style="color: var(--text-muted); font-size: 0.825rem;">
+                    Telegram isn't configured on this server (operator hasn't set TELEGRAM_BOT_TOKEN).
+                </p>
+                {% elif telegram_linked %}
+                <p id="telegram-status" style="color: var(--success); font-weight: 600; margin-bottom: 1rem;">✅ Connected</p>
+                <button class="btn btn-outline" onclick="unlinkTelegram()">Unlink Telegram</button>
+                {% else %}
+                <p id="telegram-status" style="color: var(--text-muted); font-size: 0.825rem; margin-bottom: 1rem;">Not connected.</p>
+                <div id="telegram-instructions" style="display:none; margin-bottom: 1rem;">
+                    <p style="font-size: 0.875rem;">
+                        Open Telegram, message <strong id="telegram-bot-username"></strong>, and send:
+                    </p>
+                    <p style="font-family: monospace; background: #f1f5f9; padding: 0.5rem 0.75rem; border-radius: 6px; display: inline-block; margin: 0.5rem 0;" id="telegram-code"></p>
+                </div>
+                <button id="btn-telegram-link" class="btn btn-primary" onclick="linkTelegram()">Link Telegram</button>
+                <button id="btn-telegram-check" class="btn btn-outline" style="display:none;" onclick="checkTelegramStatus()">Check Status</button>
+                {% endif %}
+            </div>
+        </div>
+
+        <!-- Sandbox Controls -->
+        <div class="settings-section">
+            <div class="settings-header">
+                <h2>⚙️ Sandbox Controls</h2>
+            </div>
+
+            <div class="settings-card">
+                <div class="form-group" style="margin-bottom: 0;">
+                    <label>Developer Sandbox Mock Mode</label>
+                    <div class="radio-group">
+                        <div class="radio-card">
+                            <input type="radio" name="mock_mode" id="mode-normal" value="normal" {% if settings.USE_MOCK_SCRAPER and mock_mode == 'normal' %}checked{% endif %} onchange="changeMockMode('normal')">
+                            <label class="radio-label" for="mode-normal">
+                                <span>🟢 Normal Slots</span>
+                                <span style="font-size: 0.7rem; color: var(--text-muted); margin-top: 0.25rem;">Generate available appointments</span>
+                            </label>
+                        </div>
+                        <div class="radio-card">
+                            <input type="radio" name="mock_mode" id="mode-empty" value="empty" {% if settings.USE_MOCK_SCRAPER and mock_mode == 'empty' %}checked{% endif %} onchange="changeMockMode('empty')">
+                            <label class="radio-label" for="mode-empty">
+                                <span>🔴 No Slots</span>
+                                <span style="font-size: 0.7rem; color: var(--text-muted); margin-top: 0.25rem;">Simulate empty calendars</span>
+                            </label>
+                        </div>
+                        <div class="radio-card">
+                            <input type="radio" name="mock_mode" id="mode-error" value="error" {% if settings.USE_MOCK_SCRAPER and mock_mode == 'error' %}checked{% endif %} onchange="changeMockMode('error')">
+                            <label class="radio-label" for="mode-error">
+                                <span>⚠️ Scraper Blocked</span>
+                                <span style="font-size: 0.7rem; color: var(--text-muted); margin-top: 0.25rem;">Simulate proxy/Cloudflare errors</span>
+                            </label>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Footer -->
+        <footer>
+            Personal use only · Polite scraping rates · Not affiliated with VFS Global, TLScontact, or any Government
+        </footer>
+    </div>
+
+    <!-- Toast Notifications Area -->
+    <div id="toast-container" class="toast-container"></div>
+
+    <script>
+        // Global variables passed from Jinja2 initially
+        let currentMonths = {{ current_months | tojson }};
+        let currentFilter = 'all';
+
+        // Toast Helper
+        function showToast(message, type = 'info') {
+            const container = document.getElementById('toast-container');
+            const toast = document.createElement('div');
+            toast.className = `toast ${type}`;
+            toast.innerHTML = `
+                <span>${message}</span>
+                <button class="toast-close" onclick="this.parentElement.remove()">&times;</button>
+            `;
+            container.appendChild(toast);
+            setTimeout(() => {
+                toast.style.opacity = '0';
+                setTimeout(() => toast.remove(), 300);
+            }, 4000);
+        }
+
+        // Relative time string generator
+        function getRelativeTime(dateString) {
+            if (!dateString) return 'never';
+            const date = new Date(dateString);
+            const now = new Date();
+            const diffMs = now - date;
+            const diffMins = Math.floor(diffMs / 60000);
+            
+            if (diffMins < 1) return 'just now';
+            if (diffMins === 1) return '1 min ago';
+            if (diffMins < 60) return `${diffMins} min ago`;
+            
+            const diffHours = Math.floor(diffMins / 60);
+            if (diffHours === 1) return '1 hour ago';
+            if (diffHours < 24) return `${diffHours} hours ago`;
+            
+            return date.toLocaleDateString();
+        }
+
+        // Render relative times across the table
+        function updateAllRelativeTimes() {
+            document.querySelectorAll('.last-checked').forEach(el => {
+                const timeAttr = el.getAttribute('data-time');
+                if (timeAttr) {
+                    el.textContent = `Last checked: ${getRelativeTime(timeAttr)}`;
+                }
+            });
+        }
+
+        // Parse slots and calculate counts for specific month index
+        function parseMonthSlots(slotsJson, monthStr) {
+            if (!slotsJson) return '—';
+            try {
+                const slots = typeof slotsJson === 'string' ? JSON.parse(slotsJson) : slotsJson;
+                if (!Array.isArray(slots)) return '—';
+                
+                // Extract target month and year (e.g., "Jun 2026")
+                const [targetMonthName, targetYearStr] = monthStr.split(' ');
+                const monthNames = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+                const targetMonthIndex = monthNames.indexOf(targetMonthName);
+                const targetYear = parseInt(targetYearStr);
+
+                let count = 0;
+                slots.forEach(slot => {
+                    const d = new Date(slot.date);
+                    if (d.getMonth() === targetMonthIndex && d.getFullYear() === targetYear) {
+                        count += slot.count;
+                    }
+                });
+
+                if (count > 0) {
+                    return `<span class="slots-count active">${count} slots</span>`;
+                }
+                return '<span class="slots-count">—</span>';
+            } catch (e) {
+                console.error("Error parsing slots json:", e);
+                return '—';
+            }
+        }
+
+        // Calculate and render all slot columns based on data attributes
+        function renderAllMonthSlots() {
+            document.querySelectorAll('.month-cell').forEach(cell => {
+                const monthIdx = parseInt(cell.getAttribute('data-month-index'));
+                const monthStr = currentMonths[monthIdx];
+                const slotsData = cell.getAttribute('data-slots');
+                if (slotsData && slotsData !== 'None' && slotsData !== '') {
+                    cell.innerHTML = parseMonthSlots(slotsData, monthStr);
+                } else {
+                    cell.innerHTML = '<span class="slots-count">—</span>';
+                }
+            });
+        }
+
+        // Apply Tab Filter (Tourism/Business/Long Stay)
+        function filterVisaType(type, buttonEl) {
+            currentFilter = type;
+            
+            // Highlight tab
+            document.querySelectorAll('.tab').forEach(tab => tab.classList.remove('active'));
+            buttonEl.classList.add('active');
+
+            // Filter rows
+            document.querySelectorAll('#table-body tr').forEach(row => {
+                const rowType = row.getAttribute('data-visa-type');
+                if (type === 'all' || rowType === type) {
+                    row.style.display = '';
+                } else {
+                    row.style.display = 'none';
+                }
+            });
+        }
+
+        // Toggle Watch Enabled state
+        async function toggleWatch(id, checkbox) {
+            const originalState = checkbox.checked;
+            try {
+                const response = await fetch(`/api/watch/${id}/toggle`, { method: 'POST' });
+                const data = await response.json();
+                if (data.ok) {
+                    showToast(`Watch status updated to ${data.enabled ? 'Enabled' : 'Disabled'}.`, 'success');
+                } else {
+                    showToast("Failed to toggle watch.", "error");
+                    checkbox.checked = !originalState;
+                }
+            } catch (error) {
+                showToast("Connection error while updating watch status.", "error");
+                checkbox.checked = !originalState;
+            }
+        }
+
+        // Trigger manual check for a single watch
+        async function checkWatch(id, button) {
+            const originalText = button.textContent;
+            button.textContent = '⏳';
+            button.disabled = true;
+            try {
+                showToast("Checking watch availability...", "info");
+                const response = await fetch(`/api/check-now/${id}`, { method: 'POST' });
+                const data = await response.json();
+                if (data.ok) {
+                    showToast("Check completed successfully.", "success");
+                    await fetchState();
+                } else {
+                    showToast("Failed to run check.", "error");
+                }
+            } catch (error) {
+                showToast("Connection error during check.", "error");
+            } finally {
+                button.textContent = originalText;
+                button.disabled = false;
+            }
+        }
+
+        // Trigger manual check for all watches
+        async function checkAll() {
+            const btn = document.getElementById('btn-check-all');
+            const originalText = btn.textContent;
+            btn.textContent = '⏳ Checking...';
+            btn.disabled = true;
+            try {
+                showToast("Starting manual check of all active watches...", "info");
+                const response = await fetch('/api/check-now', { method: 'POST' });
+                const data = await response.json();
+                if (data.ok) {
+                    showToast("Manual check completed.", "success");
+                    await fetchState();
+                } else {
+                    showToast("Failed to check all watches.", "error");
+                }
+            } catch (error) {
+                showToast("Connection error during bulk check.", "error");
+            } finally {
+                btn.textContent = originalText;
+                btn.disabled = false;
+            }
+        }
+
+        // Send Test Email alert
+        async function sendTestEmail() {
+            const btn = document.getElementById('btn-test-email');
+            const originalText = btn.textContent;
+            btn.textContent = '⏳ Sending...';
+            btn.disabled = true;
+            try {
+                const response = await fetch('/api/test-email', { method: 'POST' });
+                const data = await response.json();
+                if (data.ok) {
+                    showToast(data.message || "Test email sent successfully!", "success");
+                } else {
+                    showToast(data.message || "Failed to send test email.", "error");
+                }
+            } catch (error) {
+                showToast("Connection error sending test email.", "error");
+            } finally {
+                btn.textContent = originalText;
+                btn.disabled = false;
+            }
+        }
+
+        // Add a new watch
+        async function addWatch(event) {
+            event.preventDefault();
+            const body = {
+                centre: document.getElementById('aw_centre').value,
+                destination: document.getElementById('aw_destination').value,
+                visa_type: document.getElementById('aw_visa_type').value,
+                provider: document.getElementById('aw_provider').value,
+                booking_url: document.getElementById('aw_booking_url').value,
+                alert_before_date: document.getElementById('aw_alert_before_date').value || null,
+            };
+            try {
+                const response = await fetch('/api/watch', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(body),
+                });
+                const data = await response.json();
+                if (data.ok) {
+                    showToast("Watch added.", "success");
+                    window.location.reload();
+                } else {
+                    showToast(data.message || "Failed to add watch.", "error");
+                }
+            } catch (error) {
+                showToast("Connection error while adding watch.", "error");
+            }
+        }
+
+        // Delete a watch
+        async function deleteWatch(id, button) {
+            if (!confirm("Delete this watch?")) return;
+            button.disabled = true;
+            try {
+                const response = await fetch(`/api/watch/${id}`, { method: 'DELETE' });
+                const data = await response.json();
+                if (data.ok) {
+                    showToast("Watch deleted.", "success");
+                    document.querySelector(`tr[data-watch-id="${id}"]`)?.remove();
+                } else {
+                    showToast(data.message || "Failed to delete watch.", "error");
+                    button.disabled = false;
+                }
+            } catch (error) {
+                showToast("Connection error while deleting watch.", "error");
+                button.disabled = false;
+            }
+        }
+
+        // Save provider credentials
+        async function saveCredential(event, provider) {
+            event.preventDefault();
+            const email = document.getElementById(`cred_email_${provider}`).value;
+            const password = document.getElementById(`cred_password_${provider}`).value;
+            if (!email || !password) {
+                showToast("Email and password are both required.", "error");
+                return;
+            }
+            try {
+                const response = await fetch('/api/credentials', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ provider, email, password }),
+                });
+                const data = await response.json();
+                if (data.ok) {
+                    showToast(`${provider} credentials saved.`, "success");
+                    document.getElementById(`cred_password_${provider}`).value = '';
+                } else {
+                    showToast(data.message || "Failed to save credentials.", "error");
+                }
+            } catch (error) {
+                showToast("Connection error while saving credentials.", "error");
+            }
+        }
+
+        // Edit (or clear) a watch's alert-before cutoff date
+        async function editAlertBeforeDate(id, el) {
+            const input = prompt("Only alert if the earliest slot is before this date (YYYY-MM-DD). Leave blank to alert on any improvement:");
+            if (input === null) return; // cancelled
+            const value = input.trim();
+            if (value && !/^\d{4}-\d{2}-\d{2}$/.test(value)) {
+                showToast("Please use YYYY-MM-DD format.", "error");
+                return;
+            }
+            try {
+                const response = await fetch(`/api/watch/${id}`, {
+                    method: 'PATCH',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ alert_before_date: value || null }),
+                });
+                const data = await response.json();
+                if (data.ok) {
+                    el.textContent = value ? `🔔 Alert only before ${value}` : '🔔 Alert on any improvement';
+                    showToast("Alert cutoff updated.", "success");
+                } else {
+                    showToast(data.message || "Failed to update alert cutoff.", "error");
+                }
+            } catch (error) {
+                showToast("Connection error while updating alert cutoff.", "error");
+            }
+        }
+
+        // Link Telegram: request a one-time code from the server
+        async function linkTelegram() {
+            try {
+                const response = await fetch('/api/telegram/link', { method: 'POST' });
+                const data = await response.json();
+                if (data.ok) {
+                    document.getElementById('telegram-bot-username').textContent = data.bot_username ? `@${data.bot_username}` : 'the bot';
+                    document.getElementById('telegram-code').textContent = `/start ${data.code}`;
+                    document.getElementById('telegram-instructions').style.display = 'block';
+                    document.getElementById('btn-telegram-link').style.display = 'none';
+                    document.getElementById('btn-telegram-check').style.display = 'inline-flex';
+                } else {
+                    showToast(data.message || "Failed to start Telegram linking.", "error");
+                }
+            } catch (error) {
+                showToast("Connection error while linking Telegram.", "error");
+            }
+        }
+
+        // Poll whether the Telegram link has completed
+        async function checkTelegramStatus() {
+            try {
+                const response = await fetch('/api/telegram/status');
+                const data = await response.json();
+                if (data.linked) {
+                    showToast("Telegram connected!", "success");
+                    window.location.reload();
+                } else {
+                    showToast("Not linked yet — send the /start command in Telegram first.", "info");
+                }
+            } catch (error) {
+                showToast("Connection error while checking Telegram status.", "error");
+            }
+        }
+
+        // Disconnect Gmail
+        async function unlinkGoogle() {
+            try {
+                const response = await fetch('/api/google/unlink', { method: 'POST' });
+                const data = await response.json();
+                if (data.ok) {
+                    showToast("Gmail disconnected.", "success");
+                    window.location.reload();
+                } else {
+                    showToast("Failed to disconnect Gmail.", "error");
+                }
+            } catch (error) {
+                showToast("Connection error while disconnecting Gmail.", "error");
+            }
+        }
+
+        // Unlink Telegram
+        async function unlinkTelegram() {
+            try {
+                const response = await fetch('/api/telegram/unlink', { method: 'POST' });
+                const data = await response.json();
+                if (data.ok) {
+                    showToast("Telegram unlinked.", "success");
+                    window.location.reload();
+                } else {
+                    showToast("Failed to unlink Telegram.", "error");
+                }
+            } catch (error) {
+                showToast("Connection error while unlinking Telegram.", "error");
+            }
+        }
+
+        // Change Mock Mode
+        async function changeMockMode(mode) {
+            try {
+                const response = await fetch('/debug/mock-mode', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ mode: mode })
+                });
+                const data = await response.json();
+                if (data.ok) {
+                    showToast(`Sandbox Mock mode updated to: ${mode}`, "success");
+                    
+                    // Update badge UI
+                    const badge = document.getElementById('mock-badge');
+                    badge.className = 'badge-mode mock';
+                    badge.textContent = 'Mock Mode';
+                }
+            } catch (error) {
+                showToast("Error updating sandbox mode.", "error");
+            }
+        }
+
+        // Update UI dynamically using a full state refresh from API
+        async function fetchState() {
+            try {
+                const response = await fetch('/api/state');
+                const data = await response.json();
+                
+                currentMonths = data.current_months;
+                
+                // Update table columns header to show new months
+                const headerCells = document.querySelectorAll('thead th');
+                if (headerCells.length >= 5) {
+                    headerCells[2].textContent = currentMonths[0];
+                    headerCells[3].textContent = currentMonths[1];
+                    headerCells[4].textContent = currentMonths[2];
+                }
+
+                // Update rows
+                data.watches.forEach(watch => {
+                    const row = document.querySelector(`tr[data-watch-id="${watch.id}"]`);
+                    if (!row) return;
+
+                    // Update toggle status
+                    const toggleInput = document.getElementById(`toggle-${watch.id}`);
+                    if (toggleInput) {
+                        toggleInput.checked = watch.enabled;
+                    }
+
+                    const snapshot = data.snapshots[watch.id.toString()] || data.snapshots[watch.id];
+                    
+                    // Earliest Available cell
+                    const earliestCell = row.querySelector('.earliest-cell');
+                    const lastCheckedSpan = row.querySelector('.last-checked');
+                    
+                    if (snapshot) {
+                        if (snapshot.is_error) {
+                            earliestCell.className = 'earliest-cell blocked';
+                            earliestCell.textContent = '⚠️ Blocked';
+                            earliestCell.setAttribute('title', snapshot.error_message || 'Scraper blocked/failed');
+                        } else if (snapshot.earliest_date) {
+                            earliestCell.className = 'earliest-cell available';
+                            earliestCell.textContent = snapshot.earliest_date;
+                            earliestCell.removeAttribute('title');
+                        } else {
+                            earliestCell.className = 'earliest-cell unavailable';
+                            earliestCell.textContent = 'No slots';
+                            earliestCell.removeAttribute('title');
+                        }
+
+                        lastCheckedSpan.setAttribute('data-time', snapshot.checked_at);
+                    } else {
+                        earliestCell.className = 'earliest-cell pending';
+                        earliestCell.textContent = 'Pending...';
+                        
+                        if (watch.last_checked_at) {
+                            lastCheckedSpan.setAttribute('data-time', watch.last_checked_at);
+                        } else {
+                            lastCheckedSpan.removeAttribute('data-time');
+                            lastCheckedSpan.textContent = 'Last checked: never';
+                        }
+                    }
+
+                    // Month cells
+                    const monthCells = row.querySelectorAll('.month-cell');
+                    monthCells.forEach(cell => {
+                        const idx = parseInt(cell.getAttribute('data-month-index'));
+                        if (snapshot && snapshot.slots_json) {
+                            cell.setAttribute('data-slots', typeof snapshot.slots_json === 'string' ? snapshot.slots_json : JSON.stringify(snapshot.slots_json));
+                        } else {
+                            cell.removeAttribute('data-slots');
+                        }
+                    });
+                });
+
+                renderAllMonthSlots();
+                updateAllRelativeTimes();
+
+            } catch (error) {
+                console.error("Failed to fetch app state:", error);
+            }
+        }
+
+        // Initialize state on page load
+        document.addEventListener('DOMContentLoaded', () => {
+            renderAllMonthSlots();
+            updateAllRelativeTimes();
+            
+            // Poll for state updates every 30 seconds
+            setInterval(fetchState, 30000);
+            // Update the relative timestamps every 10 seconds
+            setInterval(updateAllRelativeTimes, 10000);
+        });
+    </script>
+</body>
+</html>
