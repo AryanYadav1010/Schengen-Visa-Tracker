@@ -8,8 +8,10 @@ A self-hosted web app that monitors Schengen visa appointment availability acros
 
 ## Features
 
+- **Multi-user accounts** — Email/password auth; each user's watches, provider credentials, and notification links are private to them
 - **Live dashboard** — Table of destinations showing earliest available date, slot counts per month, last-checked timestamps
-- **Email alerts** — Instant notification when a watched destination gains a new or earlier appointment slot
+- **Email alerts** — Instant notification when a watched destination gains a new or earlier appointment slot, sent via operator SMTP/Resend or the user's own linked Gmail (Google OAuth)
+- **Telegram alerts** — Optional: link a Telegram chat to also get pinged there
 - **Smart dedup** — Cooldown prevents duplicate alerts for the same earliest date
 - **Exponential backoff** — Handles bot-blocks gracefully without crashing
 - **Mock mode** — Test the full pipeline without hitting real visa sites
@@ -52,10 +54,10 @@ copy .env.example .env   # Windows
 # cp .env.example .env   # macOS/Linux
 ```
 
-Edit `.env` with your email settings:
+Edit `.env` — at minimum set `SECRET_KEY` (sessions + credential encryption) and, if you want real emails, your SMTP settings:
 
 ```env
-ALERT_EMAIL=your-email@example.com
+SECRET_KEY=any-long-random-string
 SMTP_USER=your-gmail@gmail.com
 SMTP_PASS=your-gmail-app-password
 ```
@@ -66,27 +68,26 @@ SMTP_PASS=your-gmail-app-password
 uvicorn app.main:app --reload
 ```
 
-Visit **http://localhost:8000** 🎉
+Visit **http://localhost:8000**, register an account, and log in.
 
-The app ships with `USE_MOCK_SCRAPER=true` by default, so it works immediately with realistic fake data — no credentials needed to try it out.
+The app ships with `USE_MOCK_SCRAPER=true` by default, so it works immediately with realistic fake data — no provider credentials needed to try it out. Per-provider login credentials (TLScontact/VFS/BLS) are entered per-user from the dashboard once you're ready to run real scrapers, not set globally in `.env`.
 
 ## Configuration (.env)
 
 | Variable | Default | Description |
 |---|---|---|
-| `ALERT_EMAIL` | — | Email address to receive alerts |
+| `SECRET_KEY` | — | Used to sign session cookies and encrypt stored provider credentials — set this to a long random string |
 | `SMTP_HOST` | `smtp.gmail.com` | SMTP server |
 | `SMTP_PORT` | `587` | SMTP port |
-| `SMTP_USER` | — | SMTP username |
+| `SMTP_USER` | — | Operator SMTP username, used as the sending account when a user hasn't linked their own Gmail |
 | `SMTP_PASS` | — | SMTP password (Gmail App Password) |
 | `RESEND_API_KEY` | — | Optional: use Resend instead of SMTP |
+| `TELEGRAM_BOT_TOKEN` / `TELEGRAM_BOT_USERNAME` | — | Optional: lets users link a Telegram chat for alerts |
+| `GOOGLE_OAUTH_CLIENT_ID` / `_SECRET` / `_REDIRECT_URI` | — | Optional: lets users link their own Gmail to send alerts from their own account instead of the operator SMTP |
 | `CHECK_INTERVAL_MINUTES` | `15` | How often to check (minutes) |
 | `ALERT_COOLDOWN_HOURS` | `12` | Don't re-alert same date within this window |
 | `DATABASE_URL` | `sqlite+aiosqlite:///data.db` | SQLAlchemy async database URL |
 | `USE_MOCK_SCRAPER` | `true` | Use fake data for testing instead of hitting real visa sites |
-| `TLSCONTACT_EMAIL` / `TLSCONTACT_PASSWORD` | — | Login for the TLScontact adapter (France, Germany) |
-| `VFS_EMAIL` / `VFS_PASSWORD` | — | Login for the VFS Global adapter (Italy, Portugal, Netherlands, Austria, Greece) |
-| `BLS_EMAIL` / `BLS_PASSWORD` | — | Login for the BLS International adapter (Spain) |
 | `ANTHROPIC_API_KEY` | — | Required for any real (non-mock) scraper — the AI agent needs Claude to drive the browser |
 | `AGENT_MODEL` | `claude-sonnet-4-6` | Claude model the agent uses |
 | `AGENT_MAX_STEPS` | `30` | Hard cap on agent actions per check (cost/runaway guard) |
@@ -125,9 +126,12 @@ app/
   main.py            # FastAPI app, routes, startup
   config.py          # pydantic-settings (.env)
   db.py              # SQLAlchemy async engine/session
-  models.py          # Watch, AvailabilitySnapshot, AlertLog
+  models.py          # User, Watch, Credential, AvailabilitySnapshot, AlertLog
+  auth.py            # Password hashing, session helpers, credential encryption
+  google_oauth.py    # Google OAuth flow (send alerts from a user's own Gmail)
+  telegram.py         # Telegram bot polling + chat-link + send
   scheduler.py       # APScheduler check loop
-  notifier.py        # Email (SMTP / Resend) + dedup
+  notifier.py        # Email (SMTP / Resend / Gmail) + Telegram + dedup
   scrapers/
     base.py          # AbstractScraper + Slot + ScraperError
     registry.py      # Maps watch → scraper class (raises ScraperError if unmatched in live mode)
@@ -137,10 +141,12 @@ app/
     vfs_global.py    # VFS Global config (Italy, Portugal, Netherlands, Austria, Greece)
     bls_spain.py     # BLS International config (Spain)
   templates/
-    index.html       # Single Jinja2 page
+    index.html       # Dashboard (Jinja2)
+    login.html        # Login page
+    register.html      # Registration page
   static/
     style.css        # Vanilla CSS
-tests/               # pytest suite (mock scraper, registry, alert cooldown, agent scraper)
+tests/               # pytest suite (mock scraper, registry, alert cooldown, agent scraper, auth, google oauth, telegram)
 ```
 
 Real providers no longer use hand-written Playwright selectors. `agent_scraper.BaseAgentScraper` drives a [browser-use](https://github.com/browser-use/browser-use) `Agent` (Claude + a real Chromium session) that reads each page itself and decides how to log in and find the calendar — it returns a structured `{status, slots, reason}` result that gets mapped onto the same `list[Slot]` / `ScraperError` contract every scraper has always used, so the scheduler/registry/notifier code didn't need to change at all.
@@ -177,17 +183,34 @@ If a provider needs task instructions beyond the generic template (e.g. an unusu
 
 ## API Endpoints
 
+Every route below except `/register`, `/login`, and `/healthz` requires an authenticated session — the app is multi-user, and each user's watches/credentials are isolated to their own account.
+
 | Method | Path | Description |
 |---|---|---|
-| `GET /` | Main page | Dashboard with table |
-| `GET /api/state` | JSON | Live state for auto-refresh |
-| `POST /api/watch/{id}/toggle` | Toggle | Enable/disable a watch |
-| `POST /api/settings` | JSON | Update email, interval |
-| `POST /api/test-email` | JSON | Send test email |
-| `POST /api/check-now` | JSON | Check all enabled watches now (concurrent, no jitter) |
+| `GET/POST /register` | HTML | Create an account |
+| `GET/POST /login` | HTML | Sign in |
+| `POST /logout` | — | End session |
+| `GET /` | HTML | Dashboard |
+| `GET /api/state` | JSON | Current user's watches + latest snapshots (auto-refresh) |
+| `POST /api/watch` | JSON | Create a watch |
+| `PATCH /api/watch/{id}` | JSON | Update a watch's `alert_before_date` |
+| `DELETE /api/watch/{id}` | JSON | Delete a watch |
+| `POST /api/watch/{id}/toggle` | JSON | Enable/disable a watch |
+| `GET /api/credentials` | JSON | Which provider credentials are linked |
+| `POST /api/credentials` | JSON | Save (encrypted) provider login credentials |
+| `GET /api/telegram/status` | JSON | Telegram link status |
+| `POST /api/telegram/link` | JSON | Link a Telegram chat for alerts |
+| `POST /api/telegram/unlink` | JSON | Unlink Telegram |
+| `GET /oauth/google/start` | Redirect | Begin Google OAuth (send alerts from your own Gmail) |
+| `GET /oauth/google/callback` | Redirect | OAuth callback |
+| `GET /api/google/status` | JSON | Google account link status |
+| `POST /api/google/unlink` | JSON | Unlink Google account |
+| `POST /api/test-email` | JSON | Send a test email |
+| `POST /api/check-now` | JSON | Check all of the current user's enabled watches now |
 | `POST /api/check-now/{id}` | JSON | Check a single watch now |
-| `GET /debug/scrape?watch_id=N` | JSON | One-off scrape |
-| `POST /debug/mock-mode` | JSON | Switch mock mode |
+| `GET /debug/scrape?watch_id=N` | JSON | One-off scrape (for a watch you own) |
+| `POST /debug/mock-mode` | JSON | Switch mock mode at runtime |
+| `GET /healthz` | JSON | Health check (used by Fly.io) |
 
 ## Testing
 
