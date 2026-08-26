@@ -86,3 +86,15 @@ def get_scraper(
         credential_email=credential_email,
         credential_password=credential_password,
     )
+
+
+_PROVIDER_DEFAULT_URLS: dict[str, str] = {
+    "tlscontact": TLScontactAgentScraper.DEFAULT_START_URL,
+    "vfs": VFSGlobalAgentScraper.DEFAULT_START_URL,
+    "bls": BLSSpainAgentScraper.DEFAULT_START_URL,
+}
+
+
+def default_booking_url(provider: str) -> str:
+    """The provider's own site, used when a watch has no custom booking_url set."""
+    return _PROVIDER_DEFAULT_URLS.get(provider, "")

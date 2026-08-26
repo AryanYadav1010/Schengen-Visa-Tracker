@@ -26,7 +26,7 @@ from app.config import settings
 from app.db import async_session
 from app.models import Watch, AvailabilitySnapshot, Credential, User
 from app.scrapers.base import ScraperError
-from app.scrapers.registry import get_scraper
+from app.scrapers.registry import get_scraper, default_booking_url
 from app import notifier
 
 logger = logging.getLogger(__name__)
@@ -242,7 +242,7 @@ async def _detect_and_alert(
             visa_type=watch.visa_type,
             centre=watch.centre,
             slots=slots,
-            booking_url=watch.booking_url,
+            booking_url=watch.booking_url or default_booking_url(watch.provider),
             to_email=owner.email,
             telegram_chat_id=owner.telegram_chat_id,
             google_refresh_token=google_refresh_token,
