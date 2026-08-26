@@ -1,4 +1,4 @@
-app = "schengenvisaappappointments"
+app = "schengenvisaappointments"
 primary_region = "iad"
 
 [build]
