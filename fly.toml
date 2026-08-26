@@ -1,4 +1,4 @@
-app = "schengen-visa-tracker"
+app = "schengenvisaappappointments"
 primary_region = "iad"
 
 [build]
