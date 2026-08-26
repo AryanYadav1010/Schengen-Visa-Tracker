@@ -12,6 +12,7 @@ class Settings(BaseSettings):
 
     # ── Auth / sessions / credential encryption ──────────────
     SECRET_KEY: str = ""
+    ADMIN_EMAIL: str = ""  # if set, only this account may use /debug/* control endpoints
 
     # ── Email sending (operator-level SMTP/Resend account) ───
     SMTP_HOST: str = "smtp.gmail.com"

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import secrets
 from contextlib import asynccontextmanager
 from datetime import datetime, date, timedelta
@@ -16,6 +17,7 @@ from starlette.middleware.sessions import SessionMiddleware
 
 from app.auth import (
     SESSION_USER_KEY,
+    check_login_rate_limit,
     decrypt_credential,
     encrypt_credential,
     get_current_user,
@@ -42,6 +44,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 PROVIDERS = ["tlscontact", "vfs", "bls"]
+VISA_TYPES = ["tourism", "business", "long_stay"]
 
 
 # ── Lifespan ─────────────────────────────────────────────────
@@ -67,7 +70,15 @@ app = FastAPI(title="Schengen Appointment Tracker", lifespan=lifespan)
 
 if not settings.SECRET_KEY:
     raise RuntimeError("SECRET_KEY must be set in .env (used for sessions + credential encryption)")
-app.add_middleware(SessionMiddleware, secret_key=settings.SECRET_KEY)
+# FLY_APP_NAME is set automatically by the Fly.io runtime — absent in local dev, where the
+# session cookie must still work over plain http://localhost.
+_running_on_fly = bool(os.environ.get("FLY_APP_NAME"))
+app.add_middleware(
+    SessionMiddleware,
+    secret_key=settings.SECRET_KEY,
+    same_site="lax",
+    https_only=_running_on_fly,
+)
 
 import pathlib
 
@@ -196,6 +207,14 @@ async def login_page(request: Request):
 
 @app.post("/login")
 async def login_submit(request: Request, email: str = Form(...), password: str = Form(...)):
+    if not check_login_rate_limit(request):
+        return templates.TemplateResponse(
+            request=request,
+            name="login.html",
+            context={"error": "Too many login attempts. Please wait a few minutes and try again."},
+            status_code=429,
+        )
+
     user = await get_user_by_email(email.strip().lower())
     if user is None or not verify_password(password, user.password_hash):
         return templates.TemplateResponse(
@@ -255,6 +274,7 @@ async def index(request: Request):
             "google_oauth_configured": bool(settings.GOOGLE_OAUTH_CLIENT_ID and settings.GOOGLE_OAUTH_CLIENT_SECRET),
             "google_linked": bool(user.google_refresh_token),
             "google_email": user.google_email,
+            "is_admin": bool(settings.ADMIN_EMAIL) and user.email == settings.ADMIN_EMAIL,
         },
     )
 
@@ -282,6 +302,10 @@ async def create_watch(request: Request, user: User = Depends(require_login)):
     required = ("centre", "destination", "visa_type", "provider")
     if any(not body.get(f) for f in required):
         return JSONResponse({"ok": False, "message": "centre, destination, visa_type, provider are required"}, 400)
+    if body["provider"] not in PROVIDERS:
+        return JSONResponse({"ok": False, "message": f"provider must be one of: {', '.join(PROVIDERS)}"}, 400)
+    if body["visa_type"] not in VISA_TYPES:
+        return JSONResponse({"ok": False, "message": f"visa_type must be one of: {', '.join(VISA_TYPES)}"}, 400)
 
     alert_before_date = None
     if body.get("alert_before_date"):
@@ -473,6 +497,12 @@ async def google_status(user: User = Depends(require_login)):
 
 @app.post("/api/google/unlink")
 async def google_unlink(user: User = Depends(require_login)):
+    if user.google_refresh_token:
+        try:
+            await google_oauth.revoke_token(decrypt_credential(user.google_refresh_token))
+        except Exception:
+            logger.exception("Failed to revoke Google token with Google (unlinking locally anyway)")
+
     async with async_session() as session:
         db_user = await session.get(User, user.id)
         db_user.google_refresh_token = None
@@ -561,7 +591,15 @@ async def debug_scrape(watch_id: int, user: User = Depends(require_login)):
 
 @app.post("/debug/mock-mode")
 async def set_mock_mode(request: Request, user: User = Depends(require_login)):
-    """Switch mock scraper mode: normal / empty / error (global dev/sandbox toggle)."""
+    """Switch mock scraper mode: normal / empty / error (global dev/sandbox toggle).
+
+    This flips shared process-wide state affecting every user's watches, so it's
+    restricted to ADMIN_EMAIL — never safe to expose to arbitrary logged-in users
+    on a multi-tenant deployment.
+    """
+    if not settings.ADMIN_EMAIL or user.email != settings.ADMIN_EMAIL:
+        return JSONResponse({"ok": False, "message": "Not authorized"}, 403)
+
     body = await request.json()
     mode = body.get("mode", "normal")
 

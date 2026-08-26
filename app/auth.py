@@ -6,6 +6,8 @@ import base64
 import hashlib
 import hmac
 import os
+import time
+from collections import defaultdict
 
 from cryptography.fernet import Fernet
 from fastapi import HTTPException, Request, status
@@ -15,7 +17,12 @@ from app.config import settings
 from app.db import async_session
 from app.models import User
 
-_PBKDF2_ITERATIONS = 390_000
+# OWASP's current PBKDF2-HMAC-SHA256 recommendation. The iteration count is embedded in
+# every new hash (format: "iterations$salt$digest"), so raising this later never invalidates
+# existing users' passwords — verify_password always re-derives using whatever count is
+# stored in *their* hash, not this constant.
+_PBKDF2_ITERATIONS = 600_000
+_LEGACY_PBKDF2_ITERATIONS = 390_000  # used by hashes from before iteration-count embedding
 
 
 # ── Password hashing ─────────────────────────────────────────
@@ -23,17 +30,30 @@ _PBKDF2_ITERATIONS = 390_000
 def hash_password(plain: str) -> str:
     salt = os.urandom(16)
     digest = hashlib.pbkdf2_hmac("sha256", plain.encode("utf-8"), salt, _PBKDF2_ITERATIONS)
-    return f"{salt.hex()}${digest.hex()}"
+    return f"{_PBKDF2_ITERATIONS}${salt.hex()}${digest.hex()}"
 
 
 def verify_password(plain: str, password_hash: str) -> bool:
+    parts = password_hash.split("$")
+    if len(parts) == 3:
+        iterations_str, salt_hex, digest_hex = parts
+        try:
+            iterations = int(iterations_str)
+        except ValueError:
+            return False
+    elif len(parts) == 2:
+        # Legacy format from before the iteration count was stored per-hash.
+        iterations = _LEGACY_PBKDF2_ITERATIONS
+        salt_hex, digest_hex = parts
+    else:
+        return False
+
     try:
-        salt_hex, digest_hex = password_hash.split("$", 1)
+        salt = bytes.fromhex(salt_hex)
+        expected = bytes.fromhex(digest_hex)
     except ValueError:
         return False
-    salt = bytes.fromhex(salt_hex)
-    expected = bytes.fromhex(digest_hex)
-    actual = hashlib.pbkdf2_hmac("sha256", plain.encode("utf-8"), salt, _PBKDF2_ITERATIONS)
+    actual = hashlib.pbkdf2_hmac("sha256", plain.encode("utf-8"), salt, iterations)
     return hmac.compare_digest(actual, expected)
 
 
@@ -78,3 +98,26 @@ async def get_user_by_email(email: str) -> User | None:
     async with async_session() as session:
         result = await session.execute(select(User).where(User.email == email))
         return result.scalar_one_or_none()
+
+
+# ── Login rate limiting ──────────────────────────────────────
+# In-memory sliding window, keyed by client IP (not email — rate-limiting by email would let
+# an attacker lock a real user out of their own account just by spamming wrong passwords for
+# their address from elsewhere). Fine for this app's single-machine deployment; would need a
+# shared store (e.g. Redis) if this ever runs as more than one instance.
+
+_LOGIN_MAX_ATTEMPTS = 10
+_LOGIN_WINDOW_SECONDS = 900  # 15 minutes
+_login_attempts: dict[str, list[float]] = defaultdict(list)
+
+
+def check_login_rate_limit(request: Request) -> bool:
+    """Return True if this client may attempt a login right now, False if rate-limited."""
+    client_ip = request.client.host if request.client else "unknown"
+    now = time.monotonic()
+    attempts = _login_attempts[client_ip]
+    attempts[:] = [t for t in attempts if now - t < _LOGIN_WINDOW_SECONDS]
+    if len(attempts) >= _LOGIN_MAX_ATTEMPTS:
+        return False
+    attempts.append(now)
+    return True

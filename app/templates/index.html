@@ -257,7 +257,8 @@
             </div>
         </div>
 
-        <!-- Sandbox Controls -->
+        <!-- Sandbox Controls (admin-only: this flips shared, process-wide mock state) -->
+        {% if is_admin %}
         <div class="settings-section">
             <div class="settings-header">
                 <h2>⚙️ Sandbox Controls</h2>
@@ -292,6 +293,7 @@
                 </div>
             </div>
         </div>
+        {% endif %}
 
         <!-- Footer -->
         <footer>

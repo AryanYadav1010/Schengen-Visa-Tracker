@@ -114,3 +114,19 @@ def _send_sync(refresh_token: str, to_email: str, subject: str, plain: str, html
 async def send_via_gmail(refresh_token: str, to_email: str, subject: str, plain: str, html: str) -> None:
     """Send via the Gmail API using the user's own connected account. Raises on failure."""
     await asyncio.to_thread(_send_sync, refresh_token, to_email, subject, plain, html)
+
+
+async def revoke_token(refresh_token: str) -> None:
+    """Revoke a refresh token with Google, not just forget it locally.
+
+    Best-effort: called right before we delete our own copy on unlink, so the token
+    can no longer be used even if it had already leaked somewhere before that.
+    """
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(
+            "https://oauth2.googleapis.com/revoke",
+            data={"token": refresh_token},
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            timeout=10,
+        )
+        resp.raise_for_status()
