@@ -80,8 +80,14 @@ class Watch(Base):
     backoff_count: int = Column(Integer, default=0, nullable=False)
 
     user = relationship("User", back_populates="watches")
-    snapshots = relationship("AvailabilitySnapshot", back_populates="watch", lazy="selectin")
-    alerts = relationship("AlertLog", back_populates="watch", lazy="selectin")
+    snapshots = relationship(
+        "AvailabilitySnapshot", back_populates="watch", lazy="selectin",
+        cascade="all, delete-orphan",
+    )
+    alerts = relationship(
+        "AlertLog", back_populates="watch", lazy="selectin",
+        cascade="all, delete-orphan",
+    )
 
     # ── Convenience helpers for the UI / scheduler ───────────
 
