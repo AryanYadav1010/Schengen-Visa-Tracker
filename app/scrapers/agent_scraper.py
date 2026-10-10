@@ -12,10 +12,10 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import date
-from typing import ClassVar
+from typing import ClassVar, Literal
 from urllib.parse import urlparse
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError, model_validator
 
 from app.config import settings
 from app.scrapers.base import AbstractScraper, ScraperError, Slot
@@ -29,12 +29,35 @@ class AgentSlot(BaseModel):
 
 
 class AgentScrapeResult(BaseModel):
-    status: str = Field(description="One of: 'slots_found', 'no_availability', 'blocked'")
+    status: Literal["slots_found", "no_availability", "blocked"] = Field(
+        description="One of: 'slots_found', 'no_availability', 'blocked'"
+    )
     slots: list[AgentSlot] = Field(default_factory=list)
     reason: str | None = Field(
         default=None,
         description="Required when status='blocked': what blocked you (CAPTCHA, Cloudflare, OTP, login failure, etc.)",
     )
+
+    @model_validator(mode="after")
+    def _status_matches_slots(self) -> "AgentScrapeResult":
+        # An empty slot list must only ever mean "checked, none available" — never "unclear".
+        if self.status == "slots_found" and not self.slots:
+            raise ValueError("status 'slots_found' requires at least one slot")
+        if self.status != "slots_found" and self.slots:
+            raise ValueError(f"status {self.status!r} must not include slots")
+        return self
+
+
+def _summarise_validation_error(e: ValidationError) -> str:
+    """'<field>: <reason>' for the first error, without the offending input.
+
+    str(e) would echo the raw LLM output, which ends up in Watch.last_error, the
+    dashboard and logs — and may contain page text or prompt-injection content.
+    """
+    first = e.errors(include_input=False, include_url=False)[0]
+    loc = ".".join(str(part) for part in first["loc"]) or "result"
+    more = f" (+{e.error_count() - 1} more)" if e.error_count() > 1 else ""
+    return f"{loc}: {first['msg']}{more}"
 
 
 TASK_TEMPLATE = """\
@@ -127,7 +150,14 @@ class BaseAgentScraper(AbstractScraper):
         except Exception as e:
             raise ScraperError(f"{self.PROVIDER_LABEL} agent execution failed: {e}")
 
-        result = history.structured_output
+        # browser-use parses the final result with AgentScrapeResult.model_validate_json, so a
+        # malformed or contradictory result surfaces here as a pydantic ValidationError.
+        try:
+            result = history.structured_output
+        except ValidationError as e:
+            raise ScraperError(
+                f"{self.PROVIDER_LABEL} agent returned an invalid result: {_summarise_validation_error(e)}"
+            ) from e
         if result is None or not history.is_successful():
             errors = [e for e in history.errors() if e]
             raise ScraperError(
@@ -138,13 +168,23 @@ class BaseAgentScraper(AbstractScraper):
         if result.status == "blocked":
             raise ScraperError(result.reason or f"{self.PROVIDER_LABEL} agent reported a block")
 
-        if result.status == "no_availability" or not result.slots:
+        if result.status == "no_availability":
             return []
 
+        # status == "slots_found" (with >= 1 slot, guaranteed by the model validator)
         slots: list[Slot] = []
-        for s in result.slots:
+        bad_indexes: list[int] = []
+        for i, s in enumerate(result.slots):
             try:
                 slots.append(Slot(appt_date=date.fromisoformat(s.date), count=max(s.count, 1), booking_url=start_url))
             except ValueError:
-                logger.warning("Agent returned unparsable date %r, skipping", s.date)
+                bad_indexes.append(i)
+        if bad_indexes:
+            # Positions only — never the raw agent-supplied strings.
+            logger.warning(
+                "%s agent returned %d of %d slot(s) with an unparsable date (indexes %s); skipping them",
+                self.PROVIDER_LABEL, len(bad_indexes), len(result.slots), bad_indexes,
+            )
+        if not slots:
+            raise ScraperError(f"{self.PROVIDER_LABEL} agent reported slots but none had a valid date")
         return slots
