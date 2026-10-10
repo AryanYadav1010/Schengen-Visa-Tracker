@@ -5,3 +5,11 @@ __pycache__/
 data.db
 .env
 .DS_Store
+.venv*/
+*.db
+*.log
+.env.*
+!.env.example
+
+# Private, local-only notes — never published
+/docs/interview/

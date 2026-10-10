@@ -6,3 +6,8 @@ tests/
 data.db
 .env
 .git/
+.venv*/
+*.db
+*.log
+.DS_Store
+docs/interview/
