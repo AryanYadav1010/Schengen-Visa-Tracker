@@ -1,6 +1,6 @@
 # 🔭 Schengen Visa Appointment Tracker
 
-A self-hosted web app that monitors Schengen visa appointment availability across visa centres and **emails you the instant a new appointment slot opens**.
+A self-hosted web app that monitors Schengen visa appointment availability across visa centres and **emails you when a new or earlier appointment slot appears** (checked every 15 minutes by default).
 
 ![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue)
 ![FastAPI](https://img.shields.io/badge/FastAPI-0.115%2B-009688)
@@ -12,7 +12,7 @@ A self-hosted web app that monitors Schengen visa appointment availability acros
 - **Live dashboard** — Table of destinations showing earliest available date, slot counts per month, last-checked timestamps
 - **Email alerts** — Instant notification when a watched destination gains a new or earlier appointment slot, sent via operator SMTP/Resend or the user's own linked Gmail (Google OAuth)
 - **Telegram alerts** — Optional: link a Telegram chat to also get pinged there
-- **Smart dedup** — Cooldown prevents duplicate alerts for the same earliest date
+- **Reliable alerts** — Each alert is recorded in a transactional outbox in the same database transaction as the observation that triggered it, then delivered and retried (up to 8 attempts, also right after a restart), revalidated before sending, and deduplicated with a cooldown
 - **Exponential backoff** — Handles bot-blocks gracefully without crashing
 - **Mock mode** — Test the full pipeline without hitting real visa sites
 - **Pluggable scrapers** — Add new centres/countries by adding one file + one registry entry
@@ -81,6 +81,7 @@ The app ships with `USE_MOCK_SCRAPER=true` by default, so it works immediately w
 | `SMTP_PORT` | `587` | SMTP port |
 | `SMTP_USER` | — | Operator SMTP username, used as the sending account when a user hasn't linked their own Gmail |
 | `SMTP_PASS` | — | SMTP password (Gmail App Password) |
+| `SMTP_TIMEOUT_SECONDS` | `20` | Per-socket-operation SMTP timeout (SMTP runs off the event loop) |
 | `RESEND_API_KEY` | — | Optional: use Resend instead of SMTP |
 | `TELEGRAM_BOT_TOKEN` / `TELEGRAM_BOT_USERNAME` | — | Optional: lets users link a Telegram chat for alerts |
 | `GOOGLE_OAUTH_CLIENT_ID` / `_SECRET` / `_REDIRECT_URI` | — | Optional: lets users link their own Gmail to send alerts from their own account instead of the operator SMTP |
@@ -131,7 +132,7 @@ app/
   google_oauth.py    # Google OAuth flow (send alerts from a user's own Gmail)
   telegram.py         # Telegram bot polling + chat-link + send
   scheduler.py       # APScheduler check loop
-  notifier.py        # Email (SMTP / Resend / Gmail) + Telegram + dedup
+  notifier.py        # Alert outbox: queue, deliver/retry, revalidate; email (SMTP / Resend / Gmail) + Telegram
   scrapers/
     base.py          # AbstractScraper + Slot + ScraperError
     registry.py      # Maps watch → scraper class (raises ScraperError if unmatched in live mode)
@@ -163,12 +164,9 @@ Since every real provider goes through the same AI agent loop, adding one is jus
    class MyNewProviderScraper(BaseAgentScraper):
        PROVIDER_LABEL: ClassVar[str] = "My New Provider"
        DEFAULT_START_URL: ClassVar[str] = "https://example-visa-provider.com/login"
-       CREDENTIAL_ENV_PREFIX: ClassVar[str] = "MYPROVIDER"  # reads MYPROVIDER_EMAIL/_PASSWORD from settings
    ```
 
-2. Add `MYPROVIDER_EMAIL` / `MYPROVIDER_PASSWORD` to `config.py` and `.env.example`.
-
-3. Register it in `app/scrapers/registry.py`:
+2. Register it in `app/scrapers/registry.py`, and add the provider name to `ProviderName` in `app/main.py`:
    ```python
    from app.scrapers.my_new_provider import MyNewProviderScraper
 
@@ -177,7 +175,7 @@ Since every real provider goes through the same AI agent loop, adding one is jus
    }
    ```
 
-4. Add a `Watch` entry in `DEFAULT_WATCHES` in `main.py` or via the database.
+3. Users add their own login for the provider under "Provider Credentials" (stored encrypted), then create a watch from the dashboard.
 
 If a provider needs task instructions beyond the generic template (e.g. an unusual multi-step visa-category picker), override `TASK_TEMPLATE` or `fetch()` in the subclass — see `agent_scraper.py` for the default prompt.
 
@@ -209,7 +207,7 @@ Every route below except `/register`, `/login`, and `/healthz` requires an authe
 | `POST /api/check-now` | JSON | Check all of the current user's enabled watches now |
 | `POST /api/check-now/{id}` | JSON | Check a single watch now |
 | `GET /debug/scrape?watch_id=N` | JSON | One-off scrape (for a watch you own) |
-| `POST /debug/mock-mode` | JSON | Switch mock mode at runtime |
+| `POST /debug/mock-mode` | JSON | Switch mock mode at runtime (only the `ADMIN_EMAIL` account) |
 | `GET /healthz` | JSON | Health check (used by Fly.io) |
 
 ## Testing
@@ -219,13 +217,15 @@ pip install -r requirements-dev.txt
 pytest tests/ -v
 ```
 
-Tests cover the mock scraper's three modes, registry resolution (including the unmatched-provider failure path), alert cooldown/dedup logic, and the agent scraper's credential/timeout/status-mapping logic (with `browser_use.Agent` mocked out — no API key, browser, or network calls needed). They don't touch real visa sites, call a real LLM, or send real emails.
+The suite is hermetic: `tests/conftest.py` overrides every credential with a blank value (environment variables take priority over `.env`), forces mock mode and a throwaway database, and points SMTP at a closed local port. It never touches real visa sites, calls a real LLM, or sends real email.
+
+It covers the HTTP API (authentication, per-user isolation, input validation), the scheduler → snapshot → alert pipeline against a real SQLite file, alert delivery failures, retries, restarts and concurrent checks, schema migration of an existing database, the SMTP timeout and threading, AI-agent result validation (with `browser_use.Agent` mocked), the registry and the mock scraper. Runs on Python 3.11 (production) through 3.14.
 
 ## Going Live With Real Scrapers
 
 `USE_MOCK_SCRAPER=true` is the safe default. Switching to `false` makes the scheduler drive a real AI agent (browser-use + Claude, real headless Chromium) against TLScontact, VFS Global, and BLS International. Before you do:
 
-- **You need real accounts and an Anthropic API key.** Each provider requires a registered account for the relevant centre/destination (`TLSCONTACT_EMAIL`/`PASSWORD` etc. in `.env`), and every check calls Claude (`ANTHROPIC_API_KEY`) to drive the browser — there's no free/local path for the real scrapers.
+- **You need real accounts and an Anthropic API key.** Each provider requires a registered account for the relevant centre/destination (entered per user in the dashboard, stored encrypted), and every check calls Claude (`ANTHROPIC_API_KEY`) to drive the browser — there's no free/local path for the real scrapers.
 - **This has never been run against the real sites.** The agent's task prompts (in `agent_scraper.py`) were written from documentation/inspection, not validated end-to-end against a real logged-in session — I don't have an Anthropic API key or your provider credentials in this environment, so the only validation done is unit tests with the agent mocked out. Run `GET /debug/scrape?watch_id=N` against **one** watch first, watch the logs, and read what the agent actually did before trusting the dashboard.
 - **Cost and latency are real, and scale with check frequency × watch count.** Each check is several Claude API calls (one per agent action — login, navigate, read calendar, etc.), not a free scripted run. With the default 15-minute interval and several watches enabled, this can add up quickly. Start with one watch, a longer interval, and check your Anthropic usage dashboard before enabling more.
 - **Built-in guardrails, but not a guarantee.** The agent has a hard step cap (`AGENT_MAX_STEPS`) and wall-clock timeout (`AGENT_TIMEOUT_SECONDS`) per check, is restricted to the target provider's domain (`allowed_domains`), is explicitly instructed to never solve a CAPTCHA and never proceed past viewing the calendar (no payment/booking/personal-data forms), and is told to treat all page content as untrusted data — not instructions — to resist prompt injection from a compromised or adversarial page. None of this is a hard technical sandbox; it's instruction-following plus hard numeric limits, same caveat as any LLM agent.
@@ -233,3 +233,19 @@ Tests cover the mock scraper's three modes, registry resolution (including the u
 - **Anti-bot defenses can still flag accounts.** These sites use Cloudflare/Turnstile, CAPTCHA, and sometimes OTP challenges. The agent fails safe (`status="blocked"` → `ScraperError` → backoff) rather than reporting a block as "no availability," but aggressive check intervals still carry a risk of triggering rate limits or account flags.
 
 Enable one watch at a time, watch its `last_error`/`backoff_until` fields after a `Check Now`, and only flip more watches to live once you've confirmed a given provider's adapter actually returns data for your account.
+
+## Deployment Notes
+
+- **Run exactly one process.** The scheduler and its locks (`asyncio.Lock`, `asyncio.Semaphore`) live inside the web process; they are not distributed locks. Keep one uvicorn worker (the Dockerfile default) and one machine. More processes would run duplicate checks and could send duplicate alerts.
+- **Persist the database.** `fly.toml` mounts a volume at `/data`; set `DATABASE_URL=sqlite+aiosqlite:////data/data.db` (e.g. `fly secrets set ...`). The default relative path lives inside the container and is lost on redeploy.
+- **Schema changes are applied at startup** with `create_all`, which only creates missing tables (the alert outbox was added this way). Altering existing tables would need a migration tool such as Alembic.
+- **Secrets** (`SECRET_KEY`, SMTP, Telegram, Google, Anthropic) belong in the platform's secret store, never in Git.
+- `/healthz` returns 503 if the database is unreachable or the scheduler is not running.
+
+## Known Limitations
+
+- Real provider scraping (TLScontact, VFS, BLS) has never been verified against the live sites; mock mode is what is demonstrated and tested.
+- Alert delivery is at-least-once: a crash between the provider accepting an email and the app recording it can cause one duplicate.
+- Retries happen once per scheduler run (15 minutes) and at startup; alerts that still fail after 8 attempts are kept with status `failed` but are only visible in the database and logs.
+- Telegram is a best-effort second channel: it is not retried and not tracked.
+- Timestamps are naive UTC; the dashboard's "last checked" can be off by the browser's UTC offset.
