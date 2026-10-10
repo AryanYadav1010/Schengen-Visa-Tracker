@@ -15,6 +15,7 @@ import asyncio
 import json
 import logging
 import random
+from collections import defaultdict
 from datetime import datetime, timedelta, date
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -24,9 +25,9 @@ from sqlalchemy import select, desc
 from app.auth import decrypt_credential
 from app.config import settings
 from app.db import async_session
-from app.models import Watch, AvailabilitySnapshot, Credential, User
+from app.models import Watch, AvailabilitySnapshot, Credential
 from app.scrapers.base import ScraperError
-from app.scrapers.registry import get_scraper, default_booking_url
+from app.scrapers.registry import get_scraper
 from app import notifier
 
 logger = logging.getLogger(__name__)
@@ -34,15 +35,28 @@ logger = logging.getLogger(__name__)
 # ── Module-level scheduler instance ──────────────────────────
 scheduler = AsyncIOScheduler()
 _semaphore = asyncio.Semaphore(3)  # max 3 concurrent scrapes
+# One check per watch at a time (scheduler vs "Check Now" vs double-clicks). Like the
+# semaphore, these are in-process asyncio locks — NOT distributed locks (ADR-001 §7).
+_watch_locks: defaultdict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
 
 
 # ── Single-watch check ───────────────────────────────────────
 
 async def _check_single_watch(watch_id: int) -> dict | None:
-    """Scrape a single watch, store the result, detect changes, alert if needed.
+    """Check one watch (serialised per watch), then try to deliver any alert it queued.
 
     Returns a summary dict or None on skip.
     """
+    async with _watch_locks[watch_id]:
+        result = await _check_and_record(watch_id)
+    if result and result.get("alert_queued"):
+        await notifier.deliver_pending_alerts(watch_id=watch_id)
+    return result
+
+
+async def _check_and_record(watch_id: int) -> dict | None:
+    """Scrape a single watch and record the outcome in ONE transaction: the snapshot, the
+    watch's backoff state and — if the observation is alert-worthy — the owed alert."""
     async with async_session() as session:
         watch = await session.get(Watch, watch_id)
         if watch is None or not watch.enabled:
@@ -85,9 +99,10 @@ async def _check_single_watch(watch_id: int) -> dict | None:
                 {"date": s.appt_date.isoformat(), "count": s.count}
                 for s in slots
             ]
+            checked_at = datetime.utcnow()
             snapshot = AvailabilitySnapshot(
                 watch_id=watch_id,
-                checked_at=datetime.utcnow(),
+                checked_at=checked_at,
                 earliest_date=earliest,
                 slots_json=json.dumps(slots_data),
                 is_error=False,
@@ -95,16 +110,18 @@ async def _check_single_watch(watch_id: int) -> dict | None:
             session.add(snapshot)
 
             # Clear backoff on success
-            watch.last_checked_at = datetime.utcnow()
+            watch.last_checked_at = checked_at
             watch.last_error = None
             watch.backoff_until = None
             watch.backoff_count = 0
 
-            await session.commit()
-
-            # ── Change detection ─────────────────────────────
+            # ── Change detection: queue an owed alert in this same transaction ──
+            alert_queued = False
             if earliest and slots:
-                await _detect_and_alert(session, watch, earliest, slots)
+                alert_queued = await _queue_alert_if_eligible(session, watch, earliest, snapshot)
+
+            # The observation and the intent to notify become durable together, or not at all.
+            await session.commit()
 
             logger.info(
                 "Watch %d (%s→%s): %d slots, earliest=%s",
@@ -116,10 +133,13 @@ async def _check_single_watch(watch_id: int) -> dict | None:
                 "status": "ok",
                 "slots": len(slots),
                 "earliest": earliest.isoformat() if earliest else None,
+                "alert_queued": alert_queued,
             }
 
         except ScraperError as e:
             # ── Scraper error: backoff ───────────────────────
+            await session.rollback()  # discard any half-written success state before recording the error
+            await session.refresh(watch)
             watch.backoff_count += 1
             backoff_minutes = min(2 ** watch.backoff_count * 2, 60)  # cap at 60 min
             watch.backoff_until = datetime.utcnow() + timedelta(minutes=backoff_minutes)
@@ -150,6 +170,10 @@ async def _check_single_watch(watch_id: int) -> dict | None:
 
         except Exception as e:
             # ── Unexpected error: log but don't crash ────────
+            # Roll back first: if the failure happened after the snapshot/alert were added (e.g.
+            # while queueing the alert), neither may be committed — the next run re-observes.
+            await session.rollback()
+            await session.refresh(watch)
             watch.last_error = f"Unexpected: {e}"
             watch.last_checked_at = datetime.utcnow()
 
@@ -196,13 +220,15 @@ def _should_alert(
     return new_earliest < prev_earliest_date
 
 
-async def _detect_and_alert(
+async def _queue_alert_if_eligible(
     session,
     watch: Watch,
     new_earliest: date,
-    slots,
-) -> None:
-    """Detect if this is a 'new opening' and send alert if so."""
+    snapshot: AvailabilitySnapshot,
+) -> bool:
+    """Eligibility: if this observation is a 'new opening' not already alerted within the
+    cooldown, queue an owed alert in the caller's transaction. Returns True if queued."""
+    await session.flush()  # make the new snapshot visible to the OFFSET 1 query below
     # Get the previous non-error snapshot (the one before the current)
     stmt = (
         select(AvailabilitySnapshot)
@@ -222,35 +248,21 @@ async def _detect_and_alert(
         alert_before_date=watch.alert_before_date,
     )
 
-    if should_alert:
-        logger.info("Watch %d: new opening detected (earliest=%s) → alerting", watch.id, new_earliest)
-    elif watch.alert_before_date is not None and new_earliest > watch.alert_before_date:
-        logger.info(
-            "Watch %d: earliest=%s is past alert_before_date=%s → suppressing alert",
-            watch.id, new_earliest, watch.alert_before_date,
-        )
+    if not should_alert:
+        if watch.alert_before_date is not None and new_earliest > watch.alert_before_date:
+            logger.info(
+                "Watch %d: earliest=%s is past alert_before_date=%s → suppressing alert",
+                watch.id, new_earliest, watch.alert_before_date,
+            )
+        return False
 
-    if should_alert:
-        owner = await session.get(User, watch.user_id)
-        google_refresh_token = (
-            decrypt_credential(owner.google_refresh_token) if owner.google_refresh_token else None
-        )
-        sent = await notifier.send_alert(
-            session=session,
-            watch_id=watch.id,
-            destination=watch.destination,
-            visa_type=watch.visa_type,
-            centre=watch.centre,
-            slots=slots,
-            booking_url=watch.booking_url or default_booking_url(watch.provider),
-            to_email=owner.email,
-            telegram_chat_id=owner.telegram_chat_id,
-            google_refresh_token=google_refresh_token,
-        )
-        if sent:
-            logger.info("Watch %d: alert email sent", watch.id)
-        else:
-            logger.info("Watch %d: alert suppressed (cooldown)", watch.id)
+    if await notifier.is_on_cooldown(session, watch.id, new_earliest):
+        logger.info("Watch %d: earliest=%s already alerted within cooldown → not queued", watch.id, new_earliest)
+        return False
+
+    alert = await notifier.queue_alert(session, watch.id, new_earliest, snapshot.slots_json, snapshot.checked_at)
+    logger.info("Watch %d: new opening detected (earliest=%s) → alert %d queued", watch.id, new_earliest, alert.id)
+    return True
 
 
 # ── Check all watches ────────────────────────────────────────
@@ -262,7 +274,16 @@ async def check_all_watches(jitter: bool = True, user_id: int | None = None) -> 
     0-120s to avoid a fixed scraping fingerprint. jitter=False (used by the
     manual 'Check Now' button) runs all watches concurrently — a user who
     clicked a button wants fast feedback, not a multi-minute wait.
+
+    A system-wide run (user_id=None, i.e. the periodic job) first retries every owed
+    alert, so retries never depend on a later scrape succeeding.
     """
+    if user_id is None:
+        try:
+            await notifier.deliver_pending_alerts()
+        except Exception:
+            logger.exception("Retrying pending alerts failed; continuing with checks")
+
     async with async_session() as session:
         stmt = select(Watch).where(Watch.enabled == True)  # noqa: E712
         if user_id is not None:
@@ -306,6 +327,13 @@ def start_scheduler() -> None:
         name="Check all visa appointment watches",
         replace_existing=True,
         max_instances=1,
+    )
+    # One-off run at startup: alerts owed from before a restart are retried now, not a full
+    # interval later. notifier._delivery_lock stops it overlapping the periodic sweep.
+    scheduler.add_job(
+        notifier.deliver_pending_alerts,
+        id="deliver_pending_alerts_on_startup",
+        replace_existing=True,
     )
     scheduler.start()
     logger.info(

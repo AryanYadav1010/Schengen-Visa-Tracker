@@ -1,45 +1,57 @@
-"""Email notification module — SMTP (Gmail App Password) or Resend API.
+"""Alert notifications — transactional outbox + email (Gmail OAuth / Resend / SMTP) + Telegram.
 
-Responsibilities:
- - Build alert email (subject + HTML + plain text)
- - Check cooldown via AlertLog before sending
- - Send via SMTP or Resend
- - Log every sent alert for dedup
+Lifecycle of an alert (ADR-001):
+ - queue_alert():           the scheduler records an owed alert (OutboxAlert, PENDING) in the
+                            SAME transaction as the snapshot that made it eligible.
+ - deliver_pending_alerts(): sends owed alerts — right after a check queues one, and again at
+                            the start of every scheduler run until each ends as SENT, FAILED
+                            (retry limit) or STALE (revalidated before sending).
+ - AlertLog:                one row per accepted email; the cooldown check reads it.
 """
 
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
 import smtplib
 from collections import defaultdict
 from datetime import datetime, timedelta, date
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from typing import TYPE_CHECKING
+from enum import StrEnum
 
 import httpx
-from sqlalchemy import select
+from sqlalchemy import desc, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.auth import decrypt_credential
 from app.config import settings
+from app.db import async_session
 from app.google_oauth import send_via_gmail
-from app.models import AlertLog
+from app.models import AlertLog, AlertStatus, AvailabilitySnapshot, OutboxAlert, User, Watch
+from app.scrapers.base import Slot
+from app.scrapers.registry import default_booking_url
 from app.telegram import send_telegram_message
-
-if TYPE_CHECKING:
-    from app.scrapers.base import Slot
 
 logger = logging.getLogger(__name__)
 
+MAX_DELIVERY_ATTEMPTS = 8            # one retry per scheduler run → ~2 h at the default 15 min
+MAX_ALERT_AGE = timedelta(hours=6)   # never send an alert detected longer ago than this
 
-# ── Cooldown check ───────────────────────────────────────────
+# One deliverer at a time in this process. NOT a distributed lock: correct only while the app
+# runs as a single process (one uvicorn worker, one machine) — see ADR-001 §7.
+_delivery_lock = asyncio.Lock()
 
-async def _is_on_cooldown(
+
+# ── Eligibility helpers (run inside the scheduler's transaction; never commit) ──
+
+async def is_on_cooldown(
     session: AsyncSession,
     watch_id: int,
     earliest_date: date,
 ) -> bool:
-    """Return True if we already alerted this watch+date within the cooldown window."""
+    """Return True if an email for this watch+date was accepted within the cooldown window."""
     cutoff = datetime.utcnow() - timedelta(hours=settings.ALERT_COOLDOWN_HOURS)
     stmt = (
         select(AlertLog)
@@ -52,21 +64,34 @@ async def _is_on_cooldown(
     return result.scalar_one_or_none() is not None
 
 
-async def _log_alert(
+async def queue_alert(
     session: AsyncSession,
     watch_id: int,
     earliest_date: date,
-    email: str,
-) -> None:
-    """Record that we sent an alert."""
-    entry = AlertLog(
-        watch_id=watch_id,
-        alerted_at=datetime.utcnow(),
-        earliest_date=earliest_date,
-        email_sent_to=email,
-    )
-    session.add(entry)
-    await session.commit()
+    slots_json: str,
+    detected_at: datetime,
+) -> OutboxAlert:
+    """Record an owed alert in the caller's transaction. Does NOT commit.
+
+    If this watch already has an undelivered alert, that one is marked SUPERSEDED (kept,
+    not overwritten): the new opening is earlier, and one email about the best date
+    beats two emails where the first is already out of date.
+    """
+    previous = (await session.execute(
+        select(OutboxAlert).where(OutboxAlert.watch_id == watch_id, OutboxAlert.status == AlertStatus.PENDING)
+    )).scalar_one_or_none()
+    if previous is not None:
+        previous.status = AlertStatus.SUPERSEDED
+        previous.resolved_at = detected_at
+        await session.flush()  # free the one-pending-per-watch unique index before inserting
+        logger.info("Alert %d for watch %d (earliest=%s) superseded by a newer opening (earliest=%s)",
+                    previous.id, watch_id, previous.earliest_date, earliest_date)
+
+    alert = OutboxAlert(watch_id=watch_id, earliest_date=earliest_date, slots_json=slots_json,
+                        detected_at=detected_at, status=AlertStatus.PENDING, attempts=0)
+    session.add(alert)
+    await session.flush()  # assigns alert.id for logging
+    return alert
 
 
 # ── Email building ───────────────────────────────────────────
@@ -77,9 +102,15 @@ def _build_email(
     centre: str,
     slots: list[Slot],
     booking_url: str,
+    checked_at: datetime | None = None,
 ) -> tuple[str, str, str]:
-    """Return (subject, plain_body, html_body)."""
+    """Return (subject, plain_body, html_body).
+
+    checked_at is when the opening was observed — a retried alert must not claim it was
+    checked at retry time.
+    """
     earliest = min(s.appt_date for s in slots)
+    checked = (checked_at or datetime.utcnow()).strftime('%Y-%m-%d %H:%M UTC')
 
     # Group by month for the summary
     by_month: dict[str, int] = defaultdict(int)
@@ -99,7 +130,7 @@ def _build_email(
         f"Earliest:    {earliest.strftime('%d %B %Y')}\n\n"
         f"Slots by month:\n{month_lines}\n\n"
         f"Book now: {booking_url}\n\n"
-        f"Checked at: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}\n"
+        f"Checked at: {checked}\n"
         f"— Schengen Appointment Tracker"
     )
 
@@ -133,7 +164,7 @@ def _build_email(
     Book Now →
   </a>
   <p style="color:#999;font-size:11px;margin-top:24px">
-    Checked at {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')} · Schengen Appointment Tracker
+    Checked at {checked} · Schengen Appointment Tracker
   </p>
 </div>"""
 
@@ -143,7 +174,7 @@ def _build_email(
 # ── Sending ──────────────────────────────────────────────────
 
 def _send_smtp(to: str, subject: str, plain: str, html: str) -> None:
-    """Send email via SMTP (Gmail App Password)."""
+    """Send email via SMTP (Gmail App Password). Blocking — call it via asyncio.to_thread."""
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
     msg["From"] = settings.SMTP_USER
@@ -151,7 +182,7 @@ def _send_smtp(to: str, subject: str, plain: str, html: str) -> None:
     msg.attach(MIMEText(plain, "plain"))
     msg.attach(MIMEText(html, "html"))
 
-    with smtplib.SMTP(settings.SMTP_HOST, settings.SMTP_PORT) as server:
+    with smtplib.SMTP(settings.SMTP_HOST, settings.SMTP_PORT, timeout=settings.SMTP_TIMEOUT_SECONDS) as server:
         server.ehlo()
         server.starttls()
         server.ehlo()
@@ -185,7 +216,9 @@ async def _send_email(to: str, subject: str, plain: str, html: str) -> None:
     if settings.use_resend:
         await _send_resend(to, subject, plain, html)
     else:
-        _send_smtp(to, subject, plain, html)
+        # smtplib is synchronous: run it on a worker thread so the event loop keeps serving
+        # requests and the scheduler while the SMTP conversation is in progress.
+        await asyncio.to_thread(_send_smtp, to, subject, plain, html)
 
 
 async def _deliver_email(
@@ -202,51 +235,120 @@ async def _deliver_email(
         await _send_email(to_email, subject, plain, html)
 
 
-# ── Public API ───────────────────────────────────────────────
+# ── Delivery (outbox relay) ──────────────────────────────────
 
-async def send_alert(
-    session: AsyncSession,
-    watch_id: int,
-    destination: str,
-    visa_type: str,
-    centre: str,
-    slots: list[Slot],
-    booking_url: str,
-    to_email: str,
-    telegram_chat_id: str | None = None,
-    google_refresh_token: str | None = None,
-) -> bool:
-    """Send an alert email (and Telegram message, if linked) if not on cooldown. Returns True if sent."""
-    if not slots:
-        return False
+class DeliveryOutcome(StrEnum):
+    SENT = "sent"
+    RETRY = "retry"      # attempt failed; stays PENDING for the next scheduler run
+    FAILED = "failed"    # attempt failed and the retry limit is reached
+    STALE = "stale"
+    SKIPPED = "skipped"  # no longer PENDING when we got to it (e.g. another deliverer finished it)
 
-    earliest = min(s.appt_date for s in slots)
 
-    # Check cooldown
-    if await _is_on_cooldown(session, watch_id, earliest):
-        logger.info(
-            "Alert suppressed (cooldown): watch=%d earliest=%s", watch_id, earliest
-        )
-        return False
+async def deliver_pending_alerts(watch_id: int | None = None) -> list[tuple[int, DeliveryOutcome]]:
+    """Attempt every PENDING alert (optionally for one watch), oldest first."""
+    async with _delivery_lock:
+        async with async_session() as session:
+            stmt = select(OutboxAlert.id).where(OutboxAlert.status == AlertStatus.PENDING).order_by(OutboxAlert.id)
+            if watch_id is not None:
+                stmt = stmt.where(OutboxAlert.watch_id == watch_id)
+            alert_ids = list((await session.execute(stmt)).scalars())
+        return [(alert_id, await _deliver_one(alert_id)) for alert_id in alert_ids]
 
-    # Build and send
-    subject, plain, html = _build_email(destination, visa_type, centre, slots, booking_url)
+
+async def _stale_reason(session: AsyncSession, alert: OutboxAlert, now: datetime) -> str | None:
+    """Revalidation policy: send only if the alert is young enough AND the latest *successful*
+    check still lists availability on or before the alerted date. A failed check (error
+    snapshot) means "unknown", so it never makes an alert stale."""
+    if now - alert.detected_at > MAX_ALERT_AGE:
+        return f"older than {MAX_ALERT_AGE}"
+    latest = (await session.execute(
+        select(AvailabilitySnapshot)
+        .where(AvailabilitySnapshot.watch_id == alert.watch_id, AvailabilitySnapshot.is_error == False)  # noqa: E712
+        .order_by(desc(AvailabilitySnapshot.checked_at))
+        .limit(1)
+    )).scalar_one_or_none()
+    if latest is not None and latest.earliest_date is None:
+        return "latest check found no availability"
+    if latest is not None and latest.earliest_date > alert.earliest_date:
+        return f"latest earliest date {latest.earliest_date} is later than alerted {alert.earliest_date}"
+    return None
+
+
+async def _deliver_one(alert_id: int) -> DeliveryOutcome:
+    now = datetime.utcnow()
+
+    # Transaction 1 — revalidate, then count the attempt BEFORE the side effect, so a send that
+    # crashes the process still uses up an attempt (the retry limit holds even under crashes).
+    async with async_session() as session:
+        alert = await session.get(OutboxAlert, alert_id)
+        if alert is None or alert.status != AlertStatus.PENDING:
+            return DeliveryOutcome.SKIPPED
+        reason = await _stale_reason(session, alert, now)
+        if reason is None and alert.attempts >= MAX_DELIVERY_ATTEMPTS:
+            alert.status, alert.resolved_at = AlertStatus.FAILED, now
+            await session.commit()
+            logger.error("Alert %d for watch %d: FAILED — retry limit reached", alert_id, alert.watch_id)
+            return DeliveryOutcome.FAILED
+        if reason is not None:
+            alert.status, alert.resolved_at, alert.last_error = AlertStatus.STALE, now, reason
+            await session.commit()
+            logger.info("Alert %d for watch %d: STALE, not sent (%s)", alert_id, alert.watch_id, reason)
+            return DeliveryOutcome.STALE
+
+        alert.attempts += 1
+        alert.last_attempt_at = now
+        watch = await session.get(Watch, alert.watch_id)
+        owner = await session.get(User, watch.user_id)
+        # Copy what the send needs, so no session/transaction is open during network I/O.
+        attempt = alert.attempts
+        earliest, slots_json, detected_at = alert.earliest_date, alert.slots_json, alert.detected_at
+        destination, visa_type, centre = watch.destination, watch.visa_type, watch.centre
+        booking_url = watch.booking_url or default_booking_url(watch.provider)
+        to_email, telegram_chat_id, encrypted_token = owner.email, owner.telegram_chat_id, owner.google_refresh_token
+        await session.commit()
+
+    # Side effect — outside any transaction (an email cannot be rolled back).
     try:
+        slots = [Slot(appt_date=date.fromisoformat(s["date"]), count=s["count"], booking_url=booking_url)
+                 for s in json.loads(slots_json)]
+        subject, plain, html = _build_email(destination, visa_type, centre, slots, booking_url, detected_at)
+        google_refresh_token = decrypt_credential(encrypted_token) if encrypted_token else None
         await _deliver_email(to_email, subject, plain, html, google_refresh_token)
-    except Exception:
-        logger.exception("Failed to send alert email for watch=%d", watch_id)
-        return False
+    except Exception as e:
+        # Transaction 2a — record the failed attempt (exception class only: no payloads in the DB).
+        async with async_session() as session:
+            alert = await session.get(OutboxAlert, alert_id)
+            alert.last_error = type(e).__name__
+            gave_up = alert.attempts >= MAX_DELIVERY_ATTEMPTS
+            if gave_up:
+                alert.status, alert.resolved_at = AlertStatus.FAILED, datetime.utcnow()
+            await session.commit()
+        if gave_up:
+            logger.error("Alert %d for watch %d: FAILED after %d attempts (%s) — kept in alert_outbox",
+                         alert_id, alert.watch_id, attempt, type(e).__name__)
+            return DeliveryOutcome.FAILED
+        logger.warning("Alert %d for watch %d: delivery attempt %d/%d failed (%s), will retry",
+                       alert_id, alert.watch_id, attempt, MAX_DELIVERY_ATTEMPTS, type(e).__name__)
+        return DeliveryOutcome.RETRY
 
-    # Telegram is a best-effort second channel — never blocks the email path or dedup log.
+    # Transaction 2b — success: status and the cooldown log entry commit together.
+    async with async_session() as session:
+        alert = await session.get(OutboxAlert, alert_id)
+        alert.status, alert.resolved_at, alert.last_error = AlertStatus.SENT, datetime.utcnow(), None
+        session.add(AlertLog(watch_id=alert.watch_id, alerted_at=alert.resolved_at,
+                             earliest_date=earliest, email_sent_to=to_email))
+        await session.commit()
+    logger.info("Alert %d for watch %d: SENT (attempt %d, earliest=%s)", alert_id, alert.watch_id, attempt, earliest)
+
+    # Telegram — best effort, AFTER the success commit (keeps the duplicate-email window minimal).
+    # Not retried and not tracked: a Telegram failure is only logged. See ADR-001 limitations.
     if telegram_chat_id:
         try:
             await send_telegram_message(telegram_chat_id, f"{subject}\n\n{plain}")
         except Exception:
-            logger.exception("Failed to send Telegram alert for watch=%d", watch_id)
-
-    # Log it
-    await _log_alert(session, watch_id, earliest, to_email)
-    return True
+            logger.exception("Alert %d: Telegram message failed (best effort, not retried)", alert_id)
+    return DeliveryOutcome.SENT
 
 
 async def send_test_email(to_email: str, google_refresh_token: str | None = None) -> dict:

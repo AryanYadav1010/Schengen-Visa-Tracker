@@ -19,6 +19,7 @@ class Settings(BaseSettings):
     SMTP_PORT: int = 587
     SMTP_USER: str = ""
     SMTP_PASS: str = ""
+    SMTP_TIMEOUT_SECONDS: float = 20  # per socket operation; without it smtplib can block forever
     RESEND_API_KEY: str = ""
 
     # ── Telegram notifications (operator-level bot) ──────────

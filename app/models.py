@@ -1,6 +1,7 @@
-"""SQLAlchemy ORM models: Watch, AvailabilitySnapshot, AlertLog."""
+"""SQLAlchemy ORM models: Watch, AvailabilitySnapshot, AlertLog, OutboxAlert."""
 
 from datetime import datetime, date
+from enum import StrEnum
 from typing import Optional
 
 from sqlalchemy import (
@@ -9,11 +10,13 @@ from sqlalchemy import (
     Date,
     DateTime,
     ForeignKey,
+    Index,
     Integer,
     String,
     Text,
     UniqueConstraint,
     func,
+    text,
 )
 from sqlalchemy.orm import DeclarativeBase, relationship
 
@@ -88,6 +91,9 @@ class Watch(Base):
         "AlertLog", back_populates="watch", lazy="selectin",
         cascade="all, delete-orphan",
     )
+    outbox_alerts = relationship(
+        "OutboxAlert", back_populates="watch", cascade="all, delete-orphan",
+    )
 
     # ── Convenience helpers for the UI / scheduler ───────────
 
@@ -136,3 +142,42 @@ class AlertLog(Base):
     email_sent_to: str = Column(String(200), nullable=False)
 
     watch = relationship("Watch", back_populates="alerts")
+
+
+class AlertStatus(StrEnum):
+    PENDING = "pending"        # owed to the user; delivery will be (re)attempted
+    SENT = "sent"              # provider accepted the email
+    FAILED = "failed"          # gave up after MAX_DELIVERY_ATTEMPTS — kept for inspection
+    SUPERSEDED = "superseded"  # a newer, earlier opening for the same watch replaced it before delivery
+    STALE = "stale"            # revalidation at send time: opening gone, or alert too old
+
+
+class OutboxAlert(Base):
+    """An alert the system owes a user (transactional outbox).
+
+    Written in the same transaction as the snapshot that made it eligible, then
+    delivered — and retried — from here. Rows are never deleted by the app; their
+    status records how each one ended.
+    """
+
+    __tablename__ = "alert_outbox"
+    __table_args__ = (
+        # At most one undelivered alert per watch, enforced by the database itself.
+        Index(
+            "uq_alert_outbox_one_pending_per_watch", "watch_id", unique=True,
+            sqlite_where=text("status = 'pending'"), postgresql_where=text("status = 'pending'"),
+        ),
+    )
+
+    id: int = Column(Integer, primary_key=True, autoincrement=True)
+    watch_id: int = Column(Integer, ForeignKey("watches.id"), nullable=False)
+    earliest_date: date = Column(Date, nullable=False)
+    slots_json: str = Column(Text, nullable=False)          # slots as observed, rendered into the email
+    detected_at: datetime = Column(DateTime, nullable=False)
+    status: str = Column(String(20), nullable=False, default=AlertStatus.PENDING)
+    attempts: int = Column(Integer, nullable=False, default=0)
+    last_attempt_at: Optional[datetime] = Column(DateTime, nullable=True)
+    last_error: Optional[str] = Column(String(200), nullable=True)  # exception class / reason only
+    resolved_at: Optional[datetime] = Column(DateTime, nullable=True)  # when it left PENDING
+
+    watch = relationship("Watch", back_populates="outbox_alerts")
