@@ -2,17 +2,21 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import secrets
 from contextlib import asynccontextmanager
 from datetime import datetime, date, timedelta
+from typing import Annotated, Literal, get_args
 
 from fastapi import Depends, FastAPI, Form, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from sqlalchemy import select, desc
+from pydantic import BaseModel, BeforeValidator, Field
+from sqlalchemy import select, desc, text
 from starlette.middleware.sessions import SessionMiddleware
 
 from app.auth import (
@@ -41,10 +45,38 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
+# httpx logs every request URL at INFO — the Telegram Bot API URL contains the bot token.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
-PROVIDERS = ["tlscontact", "vfs", "bls"]
-VISA_TYPES = ["tourism", "business", "long_stay"]
+ProviderName = Literal["tlscontact", "vfs", "bls"]
+VisaType = Literal["tourism", "business", "long_stay"]
+PROVIDERS = list(get_args(ProviderName))
+VISA_TYPES = list(get_args(VisaType))
+
+
+# ── Request bodies (validated by FastAPI; invalid input → 422, never a 500) ──
+
+OptionalDate = Annotated[date | None, BeforeValidator(lambda v: v or None)]  # "" / null → no date
+
+
+class WatchCreate(BaseModel):
+    centre: str = Field(min_length=1, max_length=100)
+    destination: str = Field(min_length=1, max_length=100)
+    visa_type: VisaType
+    provider: ProviderName
+    booking_url: str = Field(default="", max_length=500)
+    alert_before_date: OptionalDate = None
+
+
+class WatchUpdate(BaseModel):
+    alert_before_date: OptionalDate = None  # null or "" clears the cutoff
+
+
+class CredentialIn(BaseModel):
+    provider: ProviderName
+    email: str = Field(min_length=1, max_length=255)
+    password: str = Field(min_length=1, max_length=200)
 
 
 # ── Lifespan ─────────────────────────────────────────────────
@@ -67,6 +99,15 @@ async def lifespan(app: FastAPI):
 # ── App ──────────────────────────────────────────────────────
 
 app = FastAPI(title="Schengen Appointment Tracker", lifespan=lifespan)
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_error(request: Request, exc: RequestValidationError):
+    # Same {"ok", "message"} shape the dashboard already shows. Only field + reason:
+    # FastAPI's default body echoes the input back, which could include a password.
+    err = exc.errors()[0]
+    field = ".".join(str(part) for part in err["loc"] if part != "body")
+    return JSONResponse({"ok": False, "message": f"{field}: {err['msg']}" if field else err["msg"]}, 422)
 
 if not settings.SECRET_KEY:
     raise RuntimeError("SECRET_KEY must be set in .env (used for sessions + credential encryption)")
@@ -189,7 +230,8 @@ async def register_submit(request: Request, email: str = Form(...), password: st
         )
 
     async with async_session() as session:
-        user = User(email=email, password_hash=hash_password(password))
+        # PBKDF2 is deliberately slow CPU work — keep it off the event loop.
+        user = User(email=email, password_hash=await asyncio.to_thread(hash_password, password))
         session.add(user)
         await session.commit()
         await session.refresh(user)
@@ -216,7 +258,7 @@ async def login_submit(request: Request, email: str = Form(...), password: str =
         )
 
     user = await get_user_by_email(email.strip().lower())
-    if user is None or not verify_password(password, user.password_hash):
+    if user is None or not await asyncio.to_thread(verify_password, password, user.password_hash):
         return templates.TemplateResponse(
             request=request,
             name="login.html",
@@ -238,7 +280,16 @@ async def logout(request: Request):
 
 @app.get("/healthz")
 async def healthz():
-    """Unauthenticated liveness check for the deployment platform."""
+    """Unauthenticated health check for the platform: DB reachable and scheduler running.
+    A 503 makes Fly restart the machine, which also restarts the scheduler."""
+    try:
+        async with async_session() as session:
+            await session.execute(text("SELECT 1"))
+    except Exception:
+        logger.exception("Health check: database unreachable")
+        return JSONResponse({"status": "error", "reason": "database"}, 503)
+    if not sched_module.scheduler.running:
+        return JSONResponse({"status": "error", "reason": "scheduler"}, 503)
     return {"status": "ok"}
 
 
@@ -296,35 +347,10 @@ async def api_state(user: User = Depends(require_login)):
 
 
 @app.post("/api/watch")
-async def create_watch(request: Request, user: User = Depends(require_login)):
+async def create_watch(body: WatchCreate, user: User = Depends(require_login)):
     """Create a new watch owned by the current user."""
-    body = await request.json()
-    required = ("centre", "destination", "visa_type", "provider")
-    if any(not body.get(f) for f in required):
-        return JSONResponse({"ok": False, "message": "centre, destination, visa_type, provider are required"}, 400)
-    if body["provider"] not in PROVIDERS:
-        return JSONResponse({"ok": False, "message": f"provider must be one of: {', '.join(PROVIDERS)}"}, 400)
-    if body["visa_type"] not in VISA_TYPES:
-        return JSONResponse({"ok": False, "message": f"visa_type must be one of: {', '.join(VISA_TYPES)}"}, 400)
-
-    alert_before_date = None
-    if body.get("alert_before_date"):
-        try:
-            alert_before_date = date.fromisoformat(body["alert_before_date"])
-        except ValueError:
-            return JSONResponse({"ok": False, "message": "alert_before_date must be an ISO date (YYYY-MM-DD)"}, 400)
-
     async with async_session() as session:
-        watch = Watch(
-            user_id=user.id,
-            centre=body["centre"],
-            destination=body["destination"],
-            visa_type=body["visa_type"],
-            provider=body["provider"],
-            booking_url=body.get("booking_url", ""),
-            alert_before_date=alert_before_date,
-            enabled=True,
-        )
+        watch = Watch(user_id=user.id, enabled=True, **body.model_dump())
         session.add(watch)
         await session.commit()
         await session.refresh(watch)
@@ -333,23 +359,13 @@ async def create_watch(request: Request, user: User = Depends(require_login)):
 
 
 @app.patch("/api/watch/{watch_id}")
-async def update_watch(watch_id: int, request: Request, user: User = Depends(require_login)):
+async def update_watch(watch_id: int, body: WatchUpdate, user: User = Depends(require_login)):
     """Update a watch's alert_before_date — pass null/empty string to clear it."""
-    body = await request.json()
-    raw_date = body.get("alert_before_date")
-
-    alert_before_date = None
-    if raw_date:
-        try:
-            alert_before_date = date.fromisoformat(raw_date)
-        except ValueError:
-            return JSONResponse({"ok": False, "message": "alert_before_date must be an ISO date (YYYY-MM-DD)"}, 400)
-
     async with async_session() as session:
         watch = await _get_owned_watch(session, watch_id, user.id)
         if watch is None:
             return JSONResponse({"ok": False, "message": "Watch not found"}, 404)
-        watch.alert_before_date = alert_before_date
+        watch.alert_before_date = body.alert_before_date
         await session.commit()
         return {"ok": True, "watch": _watch_to_dict(watch)}
 
@@ -392,15 +408,9 @@ async def list_credentials(user: User = Depends(require_login)):
 
 
 @app.post("/api/credentials")
-async def upsert_credentials(request: Request, user: User = Depends(require_login)):
+async def upsert_credentials(body: CredentialIn, user: User = Depends(require_login)):
     """Save (or replace) a provider login for the current user. Password is encrypted at rest."""
-    body = await request.json()
-    provider = body.get("provider", "")
-    email = body.get("email", "")
-    password = body.get("password", "")
-    if provider not in PROVIDERS or not email or not password:
-        return JSONResponse({"ok": False, "message": "provider, email, and password are required"}, 400)
-
+    provider, email, password = body.provider, body.email, body.password
     async with async_session() as session:
         result = await session.execute(
             select(Credential).where(Credential.user_id == user.id, Credential.provider == provider)
