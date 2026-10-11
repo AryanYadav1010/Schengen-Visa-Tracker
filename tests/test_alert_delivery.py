@@ -194,7 +194,7 @@ async def test_observation_and_alert_intent_are_committed_atomically(env, monkey
         nonlocal calls
         calls += 1
         if calls == 1:
-            raise RuntimeError("disk full")
+            raise RuntimeError("disk full near owner@example.test")
         return await real_queue_alert(*args, **kwargs)
 
     monkeypatch.setattr(notifier, "queue_alert", queue_alert_failing_once)
@@ -204,6 +204,11 @@ async def test_observation_and_alert_intent_are_committed_atomically(env, monkey
                                         .where(AvailabilitySnapshot.is_error == False))).scalar_one()  # noqa: E712
     assert ok_snapshots == 0           # observation rolled back together with the failed intent
     assert await env.outbox() == []
+    async with env.maker() as s:       # dashboard-visible error text: class name only, no raw details
+        watch = await s.get(Watch, env.watch_id)
+        error_message = (await s.execute(select(AvailabilitySnapshot.error_message)
+                                         .where(AvailabilitySnapshot.is_error == True))).scalar_one()  # noqa: E712
+    assert watch.last_error == error_message == "Unexpected error (RuntimeError)"
     await tick()                       # the same opening is still "new" → queued and delivered
     assert len(env.mailer.delivered) == 1
 

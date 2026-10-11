@@ -155,8 +155,11 @@ async def _check_and_record(watch_id: int) -> dict | None:
 
             # ScraperError = "couldn't determine availability" (blocked, timeout, invalid
             # result): back off. Anything else is a bug: record it, but don't back off.
+            # `message` is shown on the dashboard and stored: our own ScraperError text (written
+            # to be user-facing) or just the class name of anything else — never raw exception
+            # text, which can carry data. The full traceback goes to the server log only.
             expected = isinstance(e, ScraperError)
-            message = str(e) if expected else f"Unexpected: {e}"
+            message = str(e) if expected else f"Unexpected error ({type(e).__name__})"
             backoff_minutes = None
             if expected:
                 watch.backoff_count += 1
@@ -176,7 +179,7 @@ async def _check_and_record(watch_id: int) -> dict | None:
             ))
             await session.commit()
 
-            result = {"watch_id": watch_id, "status": "error", "error": str(e)}
+            result = {"watch_id": watch_id, "status": "error", "error": message}
             if backoff_minutes is not None:
                 result["backoff_minutes"] = backoff_minutes
             return result

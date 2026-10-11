@@ -161,7 +161,9 @@ class BaseAgentScraper(AbstractScraper):
         except asyncio.TimeoutError:
             raise ScraperError(f"{self.PROVIDER_LABEL} agent timed out after {settings.AGENT_TIMEOUT_SECONDS}s")
         except Exception as e:
-            raise ScraperError(f"{self.PROVIDER_LABEL} agent execution failed: {e}")
+            # Class name only: browser/LLM error text can quote the provider's page. `from e`
+            # keeps the full cause for server-side tracebacks.
+            raise ScraperError(f"{self.PROVIDER_LABEL} agent execution failed ({type(e).__name__})") from e
 
         # browser-use parses the final result with AgentScrapeResult.model_validate_json, so a
         # malformed or contradictory result surfaces here as a pydantic ValidationError.
@@ -175,11 +177,12 @@ class BaseAgentScraper(AbstractScraper):
             errors = [e for e in history.errors() if e]
             raise ScraperError(
                 f"{self.PROVIDER_LABEL} agent did not complete successfully"
-                + (f": {errors[-1]}" if errors else " (no structured output)")
+                + (f" ({len(errors)} step error(s))" if errors else " (no structured output)")
             )
 
         if result.status == "blocked":
-            raise ScraperError(result.reason or f"{self.PROVIDER_LABEL} agent reported a block")
+            # The LLM's own short explanation ("CAPTCHA", "Cloudflare challenge"), length-capped.
+            raise ScraperError((result.reason or f"{self.PROVIDER_LABEL} agent reported a block")[:120])
 
         if result.status == "no_availability":
             return []

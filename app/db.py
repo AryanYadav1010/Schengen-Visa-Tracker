@@ -7,7 +7,9 @@ from app.models import Base
 
 # One engine (connection pool) per process. With SQLite + aiosqlite each connection runs
 # its queries in a background thread, so awaiting them never blocks the event loop.
-engine = create_async_engine(settings.DATABASE_URL, echo=False)
+# hide_parameters: DB error messages/logs show the SQL but not the bound values (emails,
+# ciphertext, ...).
+engine = create_async_engine(settings.DATABASE_URL, echo=False, hide_parameters=True)
 
 # `async with async_session() as session:` = one unit of work; leaving the block without
 # commit() rolls back. expire_on_commit=False keeps loaded attributes readable after commit

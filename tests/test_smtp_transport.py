@@ -44,8 +44,10 @@ def fake_smtp(monkeypatch):
     return _RecordingSMTP
 
 
-def test_smtp_connection_is_opened_with_the_configured_timeout(fake_smtp):
-    notifier._send_smtp("to@example.test", "s", "plain", "<p>html</p>")
+def test_smtp_connection_is_opened_with_the_configured_timeout(fake_smtp, caplog):
+    with caplog.at_level("INFO", logger="app.notifier"):
+        notifier._send_smtp("to@example.test", "s", "plain", "<p>html</p>")
+    assert "to@example.test" not in caplog.text   # recipient addresses stay out of the logs
     assert fake_smtp.instances[0].timeout == settings.SMTP_TIMEOUT_SECONDS
     assert settings.SMTP_TIMEOUT_SECONDS > 0
 

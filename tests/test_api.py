@@ -121,6 +121,10 @@ def test_users_cannot_see_or_touch_each_others_watches(client):
     assert db(f"SELECT count(*) FROM watches WHERE id={watch_id}") == [(1,)]
 
 
+def test_sql_parameters_are_kept_out_of_error_messages():
+    from app.db import engine
+    assert engine.sync_engine.hide_parameters  # DB errors won't embed emails / ciphertext
+
 def test_http_client_request_urls_are_not_logged():
     # httpx logs full URLs at INFO; Telegram's contains the bot token.
     assert logging.getLogger("httpx").getEffectiveLevel() >= logging.WARNING

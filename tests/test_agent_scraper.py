@@ -140,16 +140,20 @@ async def test_unsuccessful_run_with_no_structured_output_raises(creds, monkeypa
     monkeypatch.setattr(browser_use, "Agent", make_fake_agent_class(history))
 
     scraper = _scraper()
-    with pytest.raises(ScraperError, match="Agent got stuck on login"):
+    with pytest.raises(ScraperError, match="did not complete successfully") as exc_info:
         await scraper.fetch()
+    # Agent step errors can quote page content; they must not reach the dashboard or logs.
+    assert "Agent got stuck on login" not in str(exc_info.value)
 
 
 async def test_agent_exception_wrapped_as_scraper_error(creds, monkeypatch):
     monkeypatch.setattr(browser_use, "Agent", make_fake_agent_class(RuntimeError("browser crashed")))
 
     scraper = _scraper()
-    with pytest.raises(ScraperError, match="browser crashed"):
+    with pytest.raises(ScraperError, match="RuntimeError") as exc_info:
         await scraper.fetch()
+    assert "browser crashed" not in str(exc_info.value)          # raw text stays out of the message
+    assert isinstance(exc_info.value.__cause__, RuntimeError)    # ...but the cause is chained for tracebacks
 
 
 async def test_agent_timeout_raises_scraper_error(creds, monkeypatch):

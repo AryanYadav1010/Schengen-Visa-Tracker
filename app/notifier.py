@@ -189,7 +189,7 @@ def _send_smtp(to: str, subject: str, plain: str, html: str) -> None:
         server.login(settings.SMTP_USER, settings.SMTP_PASS)
         server.sendmail(settings.SMTP_USER, to, msg.as_string())
 
-    logger.info("SMTP email sent to %s: %s", to, subject)
+    logger.info("SMTP email sent: %s", subject)  # no recipient address in logs
 
 
 async def _send_resend(to: str, subject: str, plain: str, html: str) -> None:
@@ -208,7 +208,7 @@ async def _send_resend(to: str, subject: str, plain: str, html: str) -> None:
         )
         resp.raise_for_status()  # non-2xx → exception → counted as a failed delivery attempt
 
-    logger.info("Resend email sent to %s: %s", to, subject)
+    logger.info("Resend email sent: %s", subject)
 
 
 async def _send_email(to: str, subject: str, plain: str, html: str) -> None:
