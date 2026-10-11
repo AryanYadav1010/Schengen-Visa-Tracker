@@ -24,11 +24,16 @@ logger = logging.getLogger(__name__)
 
 
 class AgentSlot(BaseModel):
+    """One available day as the LLM reports it (date is parsed — and may be skipped — in fetch)."""
+
     date: str = Field(description="ISO date YYYY-MM-DD of an available appointment")
     count: int = Field(default=1, description="Number of slots available that day, 1 if unknown")
 
 
 class AgentScrapeResult(BaseModel):
+    """The schema the agent must fill in when it calls `done`. browser-use shows it to the LLM
+    as JSON Schema and validates the answer against it (including the validator below)."""
+
     status: Literal["slots_found", "no_availability", "blocked"] = Field(
         description="One of: 'slots_found', 'no_availability', 'blocked'"
     )
@@ -97,6 +102,12 @@ class BaseAgentScraper(AbstractScraper):
     DEFAULT_START_URL: ClassVar[str] = ""
 
     async def fetch(self) -> list[Slot]:
+        """Run one agent session: log in, open the calendar, report slots.
+
+        Every way of not getting a trustworthy answer — missing config, timeout, crash,
+        block, invalid output — becomes ScraperError, never an empty list.
+        """
+        # Cheap config checks first, so a misconfigured watch never starts a browser or an LLM call.
         email = self.credential_email
         password = self.credential_password
         if not email or not password:
@@ -105,7 +116,9 @@ class BaseAgentScraper(AbstractScraper):
             raise ScraperError("ANTHROPIC_API_KEY not configured — required for the AI agent scraper")
 
         start_url = self.booking_url or self.DEFAULT_START_URL
-        domain = urlparse(start_url).netloc
+        domain = urlparse(start_url).netloc  # the browser is confined to this domain
+        # ponytail: a user-supplied booking_url picks the domain; allowlist provider domains
+        # before live mode is opened to untrusted users.
         if not domain:
             raise ScraperError(f"{self.PROVIDER_LABEL} has no booking URL configured")
 

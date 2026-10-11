@@ -20,14 +20,17 @@ from app.models import User
 
 logger = logging.getLogger(__name__)
 
+# The bot token is part of every Bot API URL — never log these URLs (main.py silences httpx).
 _API_BASE = "https://api.telegram.org/bot{token}"
 _POLL_TIMEOUT_SECONDS = 30
 
-_poll_task: asyncio.Task | None = None
+_poll_task: asyncio.Task | None = None  # the running poll_loop, so shutdown can cancel it
 _START_RE = re.compile(r"^/start\s+(\S+)")
 
 
 def generate_link_code() -> str:
+    """8 hex chars, shown in the dashboard; the user sends "/start <code>" to the bot."""
+    # ponytail: never expires; add an expiry if codes start being shared or guessed.
     return secrets.token_hex(4)
 
 
@@ -51,6 +54,7 @@ async def send_telegram_message(chat_id: str, text: str) -> None:
 
 
 async def _process_update(update: dict) -> None:
+    """Link a chat to a user when someone sends "/start <their code>". Anything else is ignored."""
     message = update.get("message") or {}
     text = message.get("text", "")
     chat = message.get("chat") or {}
@@ -68,7 +72,7 @@ async def _process_update(update: dict) -> None:
             return
 
         user.telegram_chat_id = str(chat_id)
-        user.telegram_link_code = None
+        user.telegram_link_code = None  # one-time: a used code can't link another chat
         await session.commit()
         logger.info("Linked Telegram chat %s to user %d", chat_id, user.id)
 
@@ -85,6 +89,9 @@ async def poll_loop() -> None:
         return
 
     url = _API_BASE.format(token=settings.TELEGRAM_BOT_TOKEN) + "/getUpdates"
+    # Long polling: Telegram holds each request open up to 30 s until a message arrives.
+    # `offset` = last seen update_id + 1, which also tells Telegram those updates are handled.
+    # ponytail: only one process may poll a bot; a webhook if this ever runs on >1 machine.
     offset = 0
     logger.info("Telegram poller started")
 
@@ -104,13 +111,14 @@ async def poll_loop() -> None:
                 await _process_update(update)
 
         except asyncio.CancelledError:
-            raise
+            raise  # shutdown: let cancellation through
         except Exception:
             logger.exception("Telegram poll iteration failed, retrying shortly")
             await asyncio.sleep(5)
 
 
 def start_polling() -> None:
+    """Start poll_loop as a background task on the running event loop (FastAPI lifespan)."""
     global _poll_task
     if not settings.TELEGRAM_BOT_TOKEN:
         logger.info("Skipping Telegram poller — TELEGRAM_BOT_TOKEN not configured")
@@ -119,6 +127,7 @@ def start_polling() -> None:
 
 
 def stop_polling() -> None:
+    """Cancel the poll task (FastAPI lifespan shutdown)."""
     global _poll_task
     if _poll_task is not None:
         _poll_task.cancel()

@@ -28,12 +28,17 @@ _LEGACY_PBKDF2_ITERATIONS = 390_000  # used by hashes from before iteration-coun
 # ── Password hashing ─────────────────────────────────────────
 
 def hash_password(plain: str) -> str:
+    """Slow, salted one-way hash. A random 16-byte salt per user means equal passwords get
+    different hashes, and precomputed (rainbow) tables are useless. Blocking CPU work: call
+    it via asyncio.to_thread from async code."""
     salt = os.urandom(16)
     digest = hashlib.pbkdf2_hmac("sha256", plain.encode("utf-8"), salt, _PBKDF2_ITERATIONS)
     return f"{_PBKDF2_ITERATIONS}${salt.hex()}${digest.hex()}"
 
 
 def verify_password(plain: str, password_hash: str) -> bool:
+    """Re-hash `plain` with the salt and iteration count stored in `password_hash` and
+    compare. Any malformed hash → False (never an exception)."""
     parts = password_hash.split("$")
     if len(parts) == 3:
         iterations_str, salt_hex, digest_hex = parts
@@ -54,12 +59,16 @@ def verify_password(plain: str, password_hash: str) -> bool:
     except ValueError:
         return False
     actual = hashlib.pbkdf2_hmac("sha256", plain.encode("utf-8"), salt, iterations)
+    # Constant-time comparison: timing can't reveal how many leading bytes matched.
     return hmac.compare_digest(actual, expected)
 
 
 # ── Credential encryption (provider passwords at rest) ──────
 
 def _fernet() -> Fernet:
+    """Fernet = AES encryption + HMAC (tamper-evident), keyed from SECRET_KEY.
+    Changing SECRET_KEY makes every stored credential undecryptable."""
+    # ponytail: one app-wide key derived with plain SHA-256; MultiFernet if keys need rotating.
     if not settings.SECRET_KEY:
         raise RuntimeError("SECRET_KEY must be set in .env to encrypt/decrypt provider credentials")
     key = base64.urlsafe_b64encode(hashlib.sha256(settings.SECRET_KEY.encode("utf-8")).digest())
@@ -67,19 +76,23 @@ def _fernet() -> Fernet:
 
 
 def encrypt_credential(plain: str) -> str:
+    """Reversible on purpose: provider passwords must be decrypted again to log in."""
     return _fernet().encrypt(plain.encode("utf-8")).decode("utf-8")
 
 
 def decrypt_credential(token: str) -> str:
+    """Raises cryptography.fernet.InvalidToken if the data was tampered with or SECRET_KEY changed."""
     return _fernet().decrypt(token.encode("utf-8")).decode("utf-8")
 
 
 # ── Session-based auth ───────────────────────────────────────
 
-SESSION_USER_KEY = "user_id"
+SESSION_USER_KEY = "user_id"  # the only thing stored in the (signed) session cookie
 
 
 async def get_current_user(request: Request) -> User | None:
+    """The logged-in User, or None. The cookie is signed with SECRET_KEY, so its user id
+    can't be forged — but it can be replayed until it expires (no server-side session)."""
     user_id = request.session.get(SESSION_USER_KEY)
     if user_id is None:
         return None
@@ -88,6 +101,7 @@ async def get_current_user(request: Request) -> User | None:
 
 
 async def require_login(request: Request) -> User:
+    """FastAPI dependency: `user: User = Depends(require_login)` → 401 if not logged in."""
     user = await get_current_user(request)
     if user is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Not logged in")
@@ -95,6 +109,7 @@ async def require_login(request: Request) -> User:
 
 
 async def get_user_by_email(email: str) -> User | None:
+    """Exact match — callers pass the lowercased email."""
     async with async_session() as session:
         result = await session.execute(select(User).where(User.email == email))
         return result.scalar_one_or_none()
@@ -113,10 +128,11 @@ _login_attempts: dict[str, list[float]] = defaultdict(list)
 
 def check_login_rate_limit(request: Request) -> bool:
     """Return True if this client may attempt a login right now, False if rate-limited."""
+    # Behind a reverse proxy this is the proxy's address unless uvicorn trusts X-Forwarded-For.
     client_ip = request.client.host if request.client else "unknown"
     now = time.monotonic()
     attempts = _login_attempts[client_ip]
-    attempts[:] = [t for t in attempts if now - t < _LOGIN_WINDOW_SECONDS]
+    attempts[:] = [t for t in attempts if now - t < _LOGIN_WINDOW_SECONDS]  # drop expired attempts
     if len(attempts) >= _LOGIN_MAX_ATTEMPTS:
         return False
     attempts.append(now)

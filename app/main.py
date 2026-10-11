@@ -1,13 +1,19 @@
-"""FastAPI application — routes, startup wiring, template rendering."""
+"""FastAPI application — routes, startup wiring, template rendering.
+
+Request flow: SessionMiddleware reads the signed cookie → a route runs; JSON routes take
+`Depends(require_login)` (401 if not logged in) and a Pydantic body model (422 if invalid).
+Every query that touches a watch is scoped to the logged-in user (see _get_owned_watch).
+"""
 
 from __future__ import annotations
 
 import asyncio
 import logging
 import os
+import pathlib
 import secrets
 from contextlib import asynccontextmanager
-from datetime import datetime, date, timedelta
+from datetime import date, timedelta
 from typing import Annotated, Literal, get_args
 
 from fastapi import Depends, FastAPI, Form, Request
@@ -35,7 +41,6 @@ from app.db import async_session, init_db
 from app import google_oauth
 from app.models import AvailabilitySnapshot, Credential, User, Watch
 from app.scrapers.mock import MockScraper
-from app.scrapers.registry import get_scraper
 from app.scrapers.base import ScraperError
 from app import notifier
 from app import scheduler as sched_module
@@ -49,10 +54,11 @@ logging.basicConfig(
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
+# The allowed values live in these Literal types: Pydantic enforces them on input, and
+# PROVIDERS (the same list) drives the dashboard's credential forms.
 ProviderName = Literal["tlscontact", "vfs", "bls"]
 VisaType = Literal["tourism", "business", "long_stay"]
 PROVIDERS = list(get_args(ProviderName))
-VISA_TYPES = list(get_args(VisaType))
 
 
 # ── Request bodies (validated by FastAPI; invalid input → 422, never a 500) ──
@@ -83,7 +89,8 @@ class CredentialIn(BaseModel):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup
+    """Runs once per process: everything before `yield` at startup, after it at shutdown."""
+    # Startup — create missing tables, then start the background jobs on this event loop
     logger.info("Starting Schengen Appointment Tracker...")
     await init_db()
     sched_module.start_scheduler()
@@ -109,19 +116,21 @@ async def validation_error(request: Request, exc: RequestValidationError):
     field = ".".join(str(part) for part in err["loc"] if part != "body")
     return JSONResponse({"ok": False, "message": f"{field}: {err['msg']}" if field else err["msg"]}, 422)
 
+
+# Fail fast at import: without SECRET_KEY, sessions can't be signed or credentials decrypted.
 if not settings.SECRET_KEY:
     raise RuntimeError("SECRET_KEY must be set in .env (used for sessions + credential encryption)")
 # FLY_APP_NAME is set automatically by the Fly.io runtime — absent in local dev, where the
 # session cookie must still work over plain http://localhost.
 _running_on_fly = bool(os.environ.get("FLY_APP_NAME"))
+# Session = a signed (not encrypted) cookie holding only the user id. same_site="lax" stops
+# other sites from sending it on cross-site POST/PATCH/DELETE requests (CSRF).
 app.add_middleware(
     SessionMiddleware,
     secret_key=settings.SECRET_KEY,
     same_site="lax",
     https_only=_running_on_fly,
 )
-
-import pathlib
 
 _app_dir = pathlib.Path(__file__).parent
 app.mount("/static", StaticFiles(directory=_app_dir / "static"), name="static")
@@ -143,6 +152,7 @@ def _current_months() -> list[str]:
 
 async def _get_latest_snapshots(session, watches) -> dict[int, AvailabilitySnapshot]:
     """Return the latest snapshot for each given watch, keyed by watch_id."""
+    # ponytail: one query per watch (N+1); a single window-function query if users get many watches.
     snapshots: dict[int, AvailabilitySnapshot] = {}
     for watch in watches:
         stmt = (
@@ -160,6 +170,7 @@ async def _get_latest_snapshots(session, watches) -> dict[int, AvailabilitySnaps
 
 
 def _snapshot_to_dict(snap: AvailabilitySnapshot | None) -> dict | None:
+    """JSON-safe snapshot for /api/state (dates as ISO strings)."""
     if snap is None:
         return None
     return {
@@ -172,6 +183,7 @@ def _snapshot_to_dict(snap: AvailabilitySnapshot | None) -> dict | None:
 
 
 def _watch_to_dict(w: Watch) -> dict:
+    """JSON-safe watch for the API (dates as ISO strings)."""
     return {
         "id": w.id,
         "centre": w.centre,
@@ -189,6 +201,7 @@ def _watch_to_dict(w: Watch) -> dict:
 
 
 async def _get_user_watches(session, user_id: int) -> list[Watch]:
+    """All of one user's watches, alphabetical by destination."""
     result = await session.execute(
         select(Watch).where(Watch.user_id == user_id).order_by(Watch.destination)
     )
@@ -196,16 +209,27 @@ async def _get_user_watches(session, user_id: int) -> list[Watch]:
 
 
 async def _get_owned_watch(session, watch_id: int, user_id: int) -> Watch | None:
+    """The watch, or None if it doesn't exist OR belongs to someone else.
+
+    Callers answer both cases with the same 404, so nobody can probe which ids exist.
+    """
     watch = await session.get(Watch, watch_id)
     if watch is None or watch.user_id != user_id:
         return None
     return watch
 
 
+def _is_admin(user: User) -> bool:
+    """ADMIN_EMAIL may use the process-wide /debug/mock-mode switch. Emails are stored
+    lowercased at registration, so compare lowercased."""
+    return bool(settings.ADMIN_EMAIL) and user.email == settings.ADMIN_EMAIL.strip().lower()
+
+
 # ── Auth routes ──────────────────────────────────────────────
 
 @app.get("/register", response_class=HTMLResponse)
 async def register_page(request: Request):
+    """Registration form (already logged in → dashboard)."""
     if await get_current_user(request) is not None:
         return RedirectResponse("/", status_code=303)
     return templates.TemplateResponse(request=request, name="register.html", context={"error": None})
@@ -213,7 +237,8 @@ async def register_page(request: Request):
 
 @app.post("/register")
 async def register_submit(request: Request, email: str = Form(...), password: str = Form(...)):
-    email = email.strip().lower()
+    """Create the account, log it in (session cookie), redirect to the dashboard."""
+    email = email.strip().lower()  # one canonical form, so "A@x.com" and "a@x.com" are one account
     if len(password) < 8:
         return templates.TemplateResponse(
             request=request,
@@ -236,12 +261,13 @@ async def register_submit(request: Request, email: str = Form(...), password: st
         await session.commit()
         await session.refresh(user)
 
-    request.session[SESSION_USER_KEY] = user.id
-    return RedirectResponse("/", status_code=303)
+    request.session[SESSION_USER_KEY] = user.id  # SessionMiddleware signs this into the cookie
+    return RedirectResponse("/", status_code=303)  # 303: browser follows with a GET
 
 
 @app.get("/login", response_class=HTMLResponse)
 async def login_page(request: Request):
+    """Login form (already logged in → dashboard)."""
     if await get_current_user(request) is not None:
         return RedirectResponse("/", status_code=303)
     return templates.TemplateResponse(request=request, name="login.html", context={"error": None})
@@ -249,6 +275,7 @@ async def login_page(request: Request):
 
 @app.post("/login")
 async def login_submit(request: Request, email: str = Form(...), password: str = Form(...)):
+    """Check the password and start a session. Same message for unknown email and wrong password."""
     if not check_login_rate_limit(request):
         return templates.TemplateResponse(
             request=request,
@@ -272,6 +299,7 @@ async def login_submit(request: Request, email: str = Form(...), password: str =
 
 @app.post("/logout")
 async def logout(request: Request):
+    """Drop the user id from the session cookie."""
     request.session.pop(SESSION_USER_KEY, None)
     return RedirectResponse("/login", status_code=303)
 
@@ -315,17 +343,15 @@ async def index(request: Request):
             "snapshots": snapshots,
             "settings": settings,
             "current_months": _current_months(),
-            "now": datetime.utcnow(),
             "mock_mode": MockScraper.current_mode(),
             "providers": PROVIDERS,
             "configured_providers": configured_providers,
             "telegram_configured": bool(settings.TELEGRAM_BOT_TOKEN),
             "telegram_linked": bool(user.telegram_chat_id),
-            "telegram_bot_username": settings.TELEGRAM_BOT_USERNAME,
             "google_oauth_configured": bool(settings.GOOGLE_OAUTH_CLIENT_ID and settings.GOOGLE_OAUTH_CLIENT_SECRET),
             "google_linked": bool(user.google_refresh_token),
             "google_email": user.google_email,
-            "is_admin": bool(settings.ADMIN_EMAIL) and user.email == settings.ADMIN_EMAIL,
+            "is_admin": _is_admin(user),
         },
     )
 
@@ -350,6 +376,7 @@ async def api_state(user: User = Depends(require_login)):
 async def create_watch(body: WatchCreate, user: User = Depends(require_login)):
     """Create a new watch owned by the current user."""
     async with async_session() as session:
+        # body is already validated; its fields map 1:1 onto Watch columns
         watch = Watch(user_id=user.id, enabled=True, **body.model_dump())
         session.add(watch)
         await session.commit()
@@ -372,6 +399,7 @@ async def update_watch(watch_id: int, body: WatchUpdate, user: User = Depends(re
 
 @app.delete("/api/watch/{watch_id}")
 async def delete_watch(watch_id: int, user: User = Depends(require_login)):
+    """Delete a watch; its snapshots, alert log and outbox rows go with it (ORM cascade)."""
     async with async_session() as session:
         watch = await _get_owned_watch(session, watch_id, user.id)
         if watch is None:
@@ -416,6 +444,7 @@ async def upsert_credentials(body: CredentialIn, user: User = Depends(require_lo
             select(Credential).where(Credential.user_id == user.id, Credential.provider == provider)
         )
         credential = result.scalar_one_or_none()
+        # Encrypted (not hashed): the scraper needs the original password to log in for the user.
         encrypted = encrypt_credential(password)
         if credential is None:
             credential = Credential(user_id=user.id, provider=provider, email=email, encrypted_password=encrypted)
@@ -445,6 +474,7 @@ async def telegram_link(user: User = Depends(require_login)):
 
 @app.get("/api/telegram/status")
 async def telegram_status(user: User = Depends(require_login)):
+    """Polled by the dashboard after showing the link code, until the bot has linked the chat."""
     async with async_session() as session:
         db_user = await session.get(User, user.id)
         return {"linked": bool(db_user.telegram_chat_id)}
@@ -452,6 +482,7 @@ async def telegram_status(user: User = Depends(require_login)):
 
 @app.post("/api/telegram/unlink")
 async def telegram_unlink(user: User = Depends(require_login)):
+    """Stop Telegram alerts for this user (forget the chat id and any pending link code)."""
     async with async_session() as session:
         db_user = await session.get(User, user.id)
         db_user.telegram_chat_id = None
@@ -466,6 +497,8 @@ async def google_oauth_start(request: Request, user: User = Depends(require_logi
     if not (settings.GOOGLE_OAUTH_CLIENT_ID and settings.GOOGLE_OAUTH_CLIENT_SECRET):
         return JSONResponse({"ok": False, "message": "Google OAuth is not configured on this server"}, 400)
 
+    # Random `state` stored in the session and checked on the callback: proves the callback
+    # answers a flow this browser started (OAuth CSRF protection).
     state = secrets.token_urlsafe(16)
     request.session["google_oauth_state"] = state
     auth_url = google_oauth.build_auth_url(state)
@@ -502,11 +535,13 @@ async def google_oauth_callback(request: Request, code: str | None = None, state
 
 @app.get("/api/google/status")
 async def google_status(user: User = Depends(require_login)):
+    """Whether this user's Gmail is connected for sending, and which address."""
     return {"linked": bool(user.google_refresh_token), "email": user.google_email}
 
 
 @app.post("/api/google/unlink")
 async def google_unlink(user: User = Depends(require_login)):
+    """Revoke the token at Google (so a leaked copy dies too), then forget it locally."""
     if user.google_refresh_token:
         try:
             await google_oauth.revoke_token(decrypt_credential(user.google_refresh_token))
@@ -553,31 +588,17 @@ async def check_now_single(watch_id: int, user: User = Depends(require_login)):
 @app.get("/debug/scrape")
 async def debug_scrape(watch_id: int, user: User = Depends(require_login)):
     """Run one scrape for a watch owned by the current user and return raw JSON — for debugging."""
+    # Nothing is stored: no snapshot, no alert — just the raw scraper output.
     async with async_session() as session:
         watch = await _get_owned_watch(session, watch_id, user.id)
         if watch is None:
             return JSONResponse({"error": "Watch not found"}, 404)
-
-        credential_email, credential_password = "", ""
-        if not settings.USE_MOCK_SCRAPER:
-            cred_result = await session.execute(
-                select(Credential).where(Credential.user_id == user.id, Credential.provider == watch.provider)
-            )
-            credential = cred_result.scalar_one_or_none()
-            if credential is not None:
-                credential_email = credential.email
-                credential_password = decrypt_credential(credential.encrypted_password)
+        try:
+            scraper = await sched_module.build_scraper(session, watch)
+        except ScraperError as e:  # no scraper registered for this provider/route
+            return JSONResponse({"watch_id": watch_id, "error": "ScraperError", "message": str(e)}, 503)
 
     try:
-        scraper = get_scraper(
-            provider=watch.provider,
-            centre=watch.centre,
-            destination=watch.destination,
-            visa_type=watch.visa_type,
-            booking_url=watch.booking_url,
-            credential_email=credential_email,
-            credential_password=credential_password,
-        )
         slots = await scraper.fetch()
         return {
             "watch_id": watch_id,
@@ -607,7 +628,7 @@ async def set_mock_mode(request: Request, user: User = Depends(require_login)):
     restricted to ADMIN_EMAIL — never safe to expose to arbitrary logged-in users
     on a multi-tenant deployment.
     """
-    if not settings.ADMIN_EMAIL or user.email != settings.ADMIN_EMAIL:
+    if not _is_admin(user):
         return JSONResponse({"ok": False, "message": "Not authorized"}, 403)
 
     body = await request.json()

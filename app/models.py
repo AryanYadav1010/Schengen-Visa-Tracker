@@ -1,4 +1,13 @@
-"""SQLAlchemy ORM models: Watch, AvailabilitySnapshot, AlertLog, OutboxAlert."""
+"""SQLAlchemy ORM models (one class = one table).
+
+users ─┬─< credentials            (one encrypted provider login per user+provider)
+       └─< watches ─┬─< availability_snapshots   (one row per check: the observation)
+                    ├─< alert_logs               (one row per email the provider accepted)
+                    └─< alert_outbox             (alerts owed to the user, and how each ended)
+
+Relationships load lazily (only when accessed). They exist for the delete cascade —
+deleting a watch deletes its children — not for reading.
+"""
 
 from datetime import datetime, date
 from enum import StrEnum
@@ -22,7 +31,7 @@ from sqlalchemy.orm import DeclarativeBase, relationship
 
 
 class Base(DeclarativeBase):
-    pass
+    """Registry of all tables; init_db() creates them from Base.metadata."""
 
 
 class User(Base):
@@ -31,18 +40,18 @@ class User(Base):
     __tablename__ = "users"
 
     id: int = Column(Integer, primary_key=True, autoincrement=True)
-    email: str = Column(String(255), nullable=False, unique=True, index=True)
-    password_hash: str = Column(String(255), nullable=False)
+    email: str = Column(String(255), nullable=False, unique=True, index=True)  # stored lowercased
+    password_hash: str = Column(String(255), nullable=False)  # "iterations$salt$digest" (PBKDF2, see auth.py)
     created_at: datetime = Column(DateTime, nullable=False, default=func.now())
 
-    telegram_chat_id: Optional[str] = Column(String(64), nullable=True)
-    telegram_link_code: Optional[str] = Column(String(32), nullable=True, unique=True)
+    telegram_chat_id: Optional[str] = Column(String(64), nullable=True)  # set once the bot links a chat
+    telegram_link_code: Optional[str] = Column(String(32), nullable=True, unique=True)  # one-time /start code
 
     google_email: Optional[str] = Column(String(255), nullable=True)
     google_refresh_token: Optional[str] = Column(String(1000), nullable=True)  # encrypted at rest
 
-    watches = relationship("Watch", back_populates="user", lazy="selectin")
-    credentials = relationship("Credential", back_populates="user", lazy="selectin")
+    watches = relationship("Watch", back_populates="user")
+    credentials = relationship("Credential", back_populates="user")
 
 
 class Credential(Base):
@@ -77,23 +86,18 @@ class Watch(Base):
     booking_url: str = Column(String(500), nullable=False, default="")
     alert_before_date: Optional[date] = Column(Date, nullable=True)  # suppress alerts past this date
 
+    # Scheduler state: reset on every successful check
     last_checked_at: Optional[datetime] = Column(DateTime, nullable=True)
     last_error: Optional[str] = Column(String(500), nullable=True)
-    backoff_until: Optional[datetime] = Column(DateTime, nullable=True)
-    backoff_count: int = Column(Integer, default=0, nullable=False)
+    backoff_until: Optional[datetime] = Column(DateTime, nullable=True)  # skip checks until then
+    backoff_count: int = Column(Integer, default=0, nullable=False)  # consecutive ScraperErrors
 
     user = relationship("User", back_populates="watches")
-    snapshots = relationship(
-        "AvailabilitySnapshot", back_populates="watch", lazy="selectin",
-        cascade="all, delete-orphan",
-    )
-    alerts = relationship(
-        "AlertLog", back_populates="watch", lazy="selectin",
-        cascade="all, delete-orphan",
-    )
-    outbox_alerts = relationship(
-        "OutboxAlert", back_populates="watch", cascade="all, delete-orphan",
-    )
+    # "delete-orphan" cascade: deleting a watch deletes its rows below, instead of trying to
+    # NULL their NOT NULL watch_id (which raised a 500 before).
+    snapshots = relationship("AvailabilitySnapshot", back_populates="watch", cascade="all, delete-orphan")
+    alerts = relationship("AlertLog", back_populates="watch", cascade="all, delete-orphan")
+    outbox_alerts = relationship("OutboxAlert", back_populates="watch", cascade="all, delete-orphan")
 
     # ── Convenience helpers for the UI / scheduler ───────────
 
@@ -115,7 +119,13 @@ class Watch(Base):
 
 
 class AvailabilitySnapshot(Base):
-    """A single scrape result for a watch."""
+    """A single check of a watch: what was seen (or that the check failed).
+
+    is_error=False, earliest_date=None  → checked, nothing available (a real observation)
+    is_error=True                       → couldn't tell (blocked, timeout, bug) — ignored by
+                                          change detection and alert revalidation
+    """
+    # ponytail: one row per check forever (~96/watch/day); add a retention job when it matters.
 
     __tablename__ = "availability_snapshots"
 
@@ -145,6 +155,9 @@ class AlertLog(Base):
 
 
 class AlertStatus(StrEnum):
+    """Lifecycle of an OutboxAlert: PENDING → one of the four final states below.
+    StrEnum members are plain strings, so they store and compare like the column values."""
+
     PENDING = "pending"        # owed to the user; delivery will be (re)attempted
     SENT = "sent"              # provider accepted the email
     FAILED = "failed"          # gave up after MAX_DELIVERY_ATTEMPTS — kept for inspection

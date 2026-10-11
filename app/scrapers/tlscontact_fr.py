@@ -1,7 +1,7 @@
 """TLScontact AI-agent scraper for London -> France / Germany visa appointments.
 
 Navigation logic lives in agent_scraper.BaseAgentScraper — this file only
-supplies the provider-specific config (start URL, credential prefix).
+supplies the provider-specific config (label and start URL).
 """
 
 from __future__ import annotations

@@ -1,7 +1,7 @@
 """VFS Global AI-agent scraper for United Kingdom -> various Schengen destinations.
 
 Navigation logic lives in agent_scraper.BaseAgentScraper — this file only
-supplies the provider-specific config (start URL, credential prefix).
+supplies the provider-specific config (label and start URL).
 """
 
 from __future__ import annotations

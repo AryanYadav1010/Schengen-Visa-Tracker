@@ -4,6 +4,10 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
+    """Each field is read from, in priority order: a real environment variable (e.g. a Fly
+    secret), then the .env file, then the default below. Values are type-converted
+    ("15" → 15, "true" → True). Unknown keys are ignored."""
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
@@ -12,7 +16,7 @@ class Settings(BaseSettings):
 
     # ── Auth / sessions / credential encryption ──────────────
     SECRET_KEY: str = ""
-    ADMIN_EMAIL: str = ""  # if set, only this account may use /debug/* control endpoints
+    ADMIN_EMAIL: str = ""  # if set, only this account may flip the process-wide /debug/mock-mode switch
 
     # ── Email sending (operator-level SMTP/Resend account) ───
     SMTP_HOST: str = "smtp.gmail.com"
@@ -33,23 +37,27 @@ class Settings(BaseSettings):
 
     # ── Scheduling ───────────────────────────────────────────
     CHECK_INTERVAL_MINUTES: int = 15
-    ALERT_COOLDOWN_HOURS: int = 12
+    ALERT_COOLDOWN_HOURS: int = 12  # don't re-email the same earliest date within this window
 
     # ── Database ─────────────────────────────────────────────
+    # Relative path = inside the container. In production point it at the volume:
+    # sqlite+aiosqlite:////data/data.db
     DATABASE_URL: str = "sqlite+aiosqlite:///data.db"
 
     # ── Mock mode ────────────────────────────────────────────
-    USE_MOCK_SCRAPER: bool = True
+    USE_MOCK_SCRAPER: bool = True  # fake slots, no provider sites touched (the safe default)
 
     # ── AI agent scraper (browser-use + Claude) ──────────────
     ANTHROPIC_API_KEY: str = ""
     AGENT_MODEL: str = "claude-sonnet-4-6"
-    AGENT_MAX_STEPS: int = 30
-    AGENT_TIMEOUT_SECONDS: int = 180
+    AGENT_MAX_STEPS: int = 30          # cost / runaway guard: max agent actions per check
+    AGENT_TIMEOUT_SECONDS: int = 180   # hard wall-clock cap per check
 
     @property
     def use_resend(self) -> bool:
+        """Operator email goes through Resend when a key is set, otherwise SMTP."""
         return bool(self.RESEND_API_KEY)
 
 
+# Built once at import; every module reads this same object.
 settings = Settings()

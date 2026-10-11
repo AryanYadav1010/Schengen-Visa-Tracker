@@ -5,17 +5,21 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from app.config import settings
 from app.models import Base
 
+# One engine (connection pool) per process. With SQLite + aiosqlite each connection runs
+# its queries in a background thread, so awaiting them never blocks the event loop.
 engine = create_async_engine(settings.DATABASE_URL, echo=False)
+
+# `async with async_session() as session:` = one unit of work; leaving the block without
+# commit() rolls back. expire_on_commit=False keeps loaded attributes readable after commit
+# (routes return objects they just committed).
 async_session = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
 
 async def init_db() -> None:
-    """Create all tables if they don't exist."""
+    """Create missing tables (and their indexes) at startup.
+
+    create_all never alters existing tables, so it can only *add* schema — e.g. the
+    alert_outbox table arrived this way. Changing an existing column needs a migration tool.
+    """
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-
-
-async def get_session() -> AsyncSession:
-    """Yield a new async session (for use in route dependencies)."""
-    async with async_session() as session:
-        yield session

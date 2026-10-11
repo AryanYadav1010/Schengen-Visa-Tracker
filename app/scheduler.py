@@ -1,12 +1,15 @@
 """APScheduler-based background scheduler for periodic watch checks.
 
-Responsibilities:
- - Run all enabled watches on a configurable interval
- - Per-watch random jitter to avoid a fixed fingerprint
+Flow of one periodic run (check_all_watches):
+  1. retry every alert still owed from earlier runs (notifier.deliver_pending_alerts)
+  2. for each enabled watch, after a random 0–120 s pause:
+       scrape → store a snapshot → if it's a new/earlier opening, queue an alert
+       (all in ONE database transaction) → try to deliver that alert right away
+
+Other responsibilities:
  - Exponential backoff on ScraperError (never hammer a blocked site)
- - Change detection: detect new/earlier availability and trigger alerts
  - Semaphore-limited concurrency (max 3 parallel scrapes)
- - Never crash — all exceptions caught and logged
+ - Never crash — every exception is caught, recorded on the watch and logged
 """
 
 from __future__ import annotations
@@ -26,18 +29,43 @@ from app.auth import decrypt_credential
 from app.config import settings
 from app.db import async_session
 from app.models import Watch, AvailabilitySnapshot, Credential
-from app.scrapers.base import ScraperError
+from app.scrapers.base import AbstractScraper, ScraperError
 from app.scrapers.registry import get_scraper
 from app import notifier
 
 logger = logging.getLogger(__name__)
 
 # ── Module-level scheduler instance ──────────────────────────
+# AsyncIOScheduler runs jobs as coroutines on the same event loop as FastAPI.
 scheduler = AsyncIOScheduler()
 _semaphore = asyncio.Semaphore(3)  # max 3 concurrent scrapes
 # One check per watch at a time (scheduler vs "Check Now" vs double-clicks). Like the
 # semaphore, these are in-process asyncio locks — NOT distributed locks (ADR-001 §7).
+# ponytail: single-process only; a DB row lock (Postgres FOR UPDATE) if this ever scales out.
 _watch_locks: defaultdict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
+
+
+async def build_scraper(session, watch: Watch) -> AbstractScraper:
+    """The scraper for a watch, with the owner's provider login decrypted (live mode only).
+
+    Raises ScraperError if no scraper is registered for the watch's provider/route.
+    """
+    email = password = ""
+    if not settings.USE_MOCK_SCRAPER:  # the mock scraper never logs in, so skip the decrypt
+        credential = (await session.execute(
+            select(Credential).where(Credential.user_id == watch.user_id, Credential.provider == watch.provider)
+        )).scalar_one_or_none()
+        if credential is not None:
+            email, password = credential.email, decrypt_credential(credential.encrypted_password)
+    return get_scraper(
+        provider=watch.provider,
+        centre=watch.centre,
+        destination=watch.destination,
+        visa_type=watch.visa_type,
+        booking_url=watch.booking_url,
+        credential_email=email,
+        credential_password=password,
+    )
 
 
 # ── Single-watch check ───────────────────────────────────────
@@ -49,6 +77,8 @@ async def _check_single_watch(watch_id: int) -> dict | None:
     """
     async with _watch_locks[watch_id]:
         result = await _check_and_record(watch_id)
+    # Deliver after releasing the watch lock: lock order is always watch → delivery, never
+    # the reverse, so the two locks can't deadlock.
     if result and result.get("alert_queued"):
         await notifier.deliver_pending_alerts(watch_id=watch_id)
     return result
@@ -62,38 +92,18 @@ async def _check_and_record(watch_id: int) -> dict | None:
         if watch is None or not watch.enabled:
             return None
 
-        # Skip if in backoff
+        # Skip if a recent failure put this watch in backoff
         if watch.backoff_until and datetime.utcnow() < watch.backoff_until:
             logger.debug("Watch %d still in backoff until %s", watch_id, watch.backoff_until)
             return None
 
         try:
-            credential_email = ""
-            credential_password = ""
-            if not settings.USE_MOCK_SCRAPER:
-                cred_stmt = select(Credential).where(
-                    Credential.user_id == watch.user_id,
-                    Credential.provider == watch.provider,
-                )
-                cred_result = await session.execute(cred_stmt)
-                credential = cred_result.scalar_one_or_none()
-                if credential is not None:
-                    credential_email = credential.email
-                    credential_password = decrypt_credential(credential.encrypted_password)
-
-            scraper = get_scraper(
-                provider=watch.provider,
-                centre=watch.centre,
-                destination=watch.destination,
-                visa_type=watch.visa_type,
-                booking_url=watch.booking_url,
-                credential_email=credential_email,
-                credential_password=credential_password,
-            )
-            async with _semaphore:
+            scraper = await build_scraper(session, watch)
+            async with _semaphore:  # at most 3 scrapes in flight in this process
                 slots = await scraper.fetch()
 
             # ── Success: store snapshot ──────────────────────
+            # [] is a real observation ("checked, nothing available"), not an error.
             earliest = min((s.appt_date for s in slots), default=None)
             slots_data = [
                 {"date": s.appt_date.isoformat(), "count": s.count}
@@ -136,88 +146,58 @@ async def _check_and_record(watch_id: int) -> dict | None:
                 "alert_queued": alert_queued,
             }
 
-        except ScraperError as e:
-            # ── Scraper error: backoff ───────────────────────
-            await session.rollback()  # discard any half-written success state before recording the error
-            await session.refresh(watch)
-            watch.backoff_count += 1
-            backoff_minutes = min(2 ** watch.backoff_count * 2, 60)  # cap at 60 min
-            watch.backoff_until = datetime.utcnow() + timedelta(minutes=backoff_minutes)
-            watch.last_error = str(e)
-            watch.last_checked_at = datetime.utcnow()
-
-            snapshot = AvailabilitySnapshot(
-                watch_id=watch_id,
-                checked_at=datetime.utcnow(),
-                earliest_date=None,
-                slots_json="[]",
-                is_error=True,
-                error_message=str(e),
-            )
-            session.add(snapshot)
-            await session.commit()
-
-            logger.warning(
-                "Watch %d ScraperError (backoff %d min): %s",
-                watch_id, backoff_minutes, e,
-            )
-            return {
-                "watch_id": watch_id,
-                "status": "error",
-                "error": str(e),
-                "backoff_minutes": backoff_minutes,
-            }
-
         except Exception as e:
-            # ── Unexpected error: log but don't crash ────────
             # Roll back first: if the failure happened after the snapshot/alert were added (e.g.
             # while queueing the alert), neither may be committed — the next run re-observes.
+            # refresh() reloads the watch, since rollback expired its loaded attributes.
             await session.rollback()
             await session.refresh(watch)
-            watch.last_error = f"Unexpected: {e}"
-            watch.last_checked_at = datetime.utcnow()
 
-            snapshot = AvailabilitySnapshot(
-                watch_id=watch_id,
-                checked_at=datetime.utcnow(),
-                earliest_date=None,
-                slots_json="[]",
-                is_error=True,
-                error_message=f"Unexpected: {e}",
-            )
-            session.add(snapshot)
+            # ScraperError = "couldn't determine availability" (blocked, timeout, invalid
+            # result): back off. Anything else is a bug: record it, but don't back off.
+            expected = isinstance(e, ScraperError)
+            message = str(e) if expected else f"Unexpected: {e}"
+            backoff_minutes = None
+            if expected:
+                watch.backoff_count += 1
+                backoff_minutes = min(2 ** watch.backoff_count * 2, 60)  # 4, 8, 16, 32, 60 min
+                watch.backoff_until = datetime.utcnow() + timedelta(minutes=backoff_minutes)
+                logger.warning("Watch %d ScraperError (backoff %d min): %s", watch_id, backoff_minutes, e)
+            else:
+                logger.exception("Unexpected error in watch %d", watch_id)
+
+            # An error snapshot records "unknown" — change detection and alert revalidation
+            # both ignore it, so a failed check never looks like "no availability".
+            watch.last_error = message
+            watch.last_checked_at = datetime.utcnow()
+            session.add(AvailabilitySnapshot(
+                watch_id=watch_id, checked_at=watch.last_checked_at, earliest_date=None,
+                slots_json="[]", is_error=True, error_message=message,
+            ))
             await session.commit()
 
-            logger.exception("Unexpected error in watch %d", watch_id)
-            return {
-                "watch_id": watch_id,
-                "status": "error",
-                "error": str(e),
-            }
+            result = {"watch_id": watch_id, "status": "error", "error": str(e)}
+            if backoff_minutes is not None:
+                result["backoff_minutes"] = backoff_minutes
+            return result
 
 
 def _should_alert(
     prev_earliest_date: date | None,
-    prev_exists: bool,
     new_earliest: date,
     alert_before_date: date | None,
 ) -> bool:
     """Pure decision logic for whether a 'new opening' should trigger an alert.
 
-    New opening = previously no availability OR new earliest date is earlier
-    than the last non-error snapshot's earliest date. A configured
-    alert_before_date overrides all of that — if the new earliest date falls
-    after it, the alert is suppressed regardless (the watch keeps scraping,
-    it just won't notify until something earlier than the cutoff shows up).
+    New opening = previously no availability (no earlier successful check, or it found
+    nothing) OR the new earliest date is earlier than the previous one. A configured
+    alert_before_date overrides all of that — if the new earliest date falls after it,
+    the alert is suppressed (the watch keeps scraping, it just won't notify until
+    something earlier than the cutoff shows up).
     """
     if alert_before_date is not None and new_earliest > alert_before_date:
         return False
-
-    if not prev_exists:
-        return True
-    if prev_earliest_date is None:
-        return True
-    return new_earliest < prev_earliest_date
+    return prev_earliest_date is None or new_earliest < prev_earliest_date
 
 
 async def _queue_alert_if_eligible(
@@ -243,7 +223,6 @@ async def _queue_alert_if_eligible(
 
     should_alert = _should_alert(
         prev_earliest_date=prev.earliest_date if prev else None,
-        prev_exists=prev is not None,
         new_earliest=new_earliest,
         alert_before_date=watch.alert_before_date,
     )
@@ -256,6 +235,7 @@ async def _queue_alert_if_eligible(
             )
         return False
 
+    # Same date already emailed within ALERT_COOLDOWN_HOURS (e.g. it vanished and came back)
     if await notifier.is_on_cooldown(session, watch.id, new_earliest):
         logger.info("Watch %d: earliest=%s already alerted within cooldown → not queued", watch.id, new_earliest)
         return False
@@ -296,12 +276,16 @@ async def check_all_watches(jitter: bool = True, user_id: int | None = None) -> 
         return []
 
     if not jitter:
+        # All at once; _semaphore still caps real scrapes at 3.
         gathered = await asyncio.gather(*(_check_single_watch(w.id) for w in watches))
         return [r for r in gathered if r]
 
     results = []
     for watch in watches:
-        # Random jitter: 0–120 seconds before each watch
+        # Random jitter: 0–120 seconds before each watch, so checks don't hit providers
+        # at a fixed, bot-like rhythm.
+        # ponytail: sequential, so ~15 watches fill a 15-min interval; per-watch next_check_at
+        # timestamps if the watch count grows.
         delay = random.uniform(0, 120)
         await asyncio.sleep(delay)
         r = await _check_single_watch(watch.id)
@@ -319,7 +303,10 @@ async def check_one_watch(watch_id: int) -> dict | None:
 # ── Scheduler lifecycle ──────────────────────────────────────
 
 def start_scheduler() -> None:
-    """Start the APScheduler periodic job."""
+    """Start the APScheduler periodic job (called from the FastAPI lifespan on startup).
+
+    max_instances=1: if a run is still going when the next is due, the next is skipped.
+    """
     scheduler.add_job(
         check_all_watches,
         trigger=IntervalTrigger(minutes=settings.CHECK_INTERVAL_MINUTES),
@@ -343,7 +330,11 @@ def start_scheduler() -> None:
 
 
 def stop_scheduler() -> None:
-    """Gracefully shut down the scheduler."""
+    """Shut down the scheduler (FastAPI lifespan, on shutdown).
+
+    wait=False: an in-flight run is cancelled. That's safe — every check commits in one
+    transaction (or not at all) and owed alerts are retried at the next startup.
+    """
     if scheduler.running:
         scheduler.shutdown(wait=False)
         logger.info("Scheduler stopped")

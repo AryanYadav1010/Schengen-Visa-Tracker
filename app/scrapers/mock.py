@@ -18,6 +18,7 @@ class MockScraper(AbstractScraper):
     """Returns fake appointment data for testing the full pipeline."""
 
     # ── Class-level toggles (shared across all instances) ────
+    # Process-wide: flipping them affects every user's watches, hence admin-only in main.py.
     _force_error: bool = False        # raise ScraperError on next fetch
     _force_empty: bool = False        # return [] (no availability)
     _error_message: str = "Simulated CAPTCHA / Cloudflare block"

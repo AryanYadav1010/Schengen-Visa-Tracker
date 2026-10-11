@@ -184,7 +184,7 @@ def _send_smtp(to: str, subject: str, plain: str, html: str) -> None:
 
     with smtplib.SMTP(settings.SMTP_HOST, settings.SMTP_PORT, timeout=settings.SMTP_TIMEOUT_SECONDS) as server:
         server.ehlo()
-        server.starttls()
+        server.starttls()  # upgrade to TLS before the password is sent
         server.ehlo()
         server.login(settings.SMTP_USER, settings.SMTP_PASS)
         server.sendmail(settings.SMTP_USER, to, msg.as_string())
@@ -193,7 +193,7 @@ def _send_smtp(to: str, subject: str, plain: str, html: str) -> None:
 
 
 async def _send_resend(to: str, subject: str, plain: str, html: str) -> None:
-    """Send email via Resend API."""
+    """Send email via Resend API (async HTTP; httpx's default 5 s timeout bounds it)."""
     async with httpx.AsyncClient() as client:
         resp = await client.post(
             "https://api.resend.com/emails",
@@ -206,7 +206,7 @@ async def _send_resend(to: str, subject: str, plain: str, html: str) -> None:
                 "html": html,
             },
         )
-        resp.raise_for_status()
+        resp.raise_for_status()  # non-2xx → exception → counted as a failed delivery attempt
 
     logger.info("Resend email sent to %s: %s", to, subject)
 

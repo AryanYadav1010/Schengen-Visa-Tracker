@@ -23,6 +23,7 @@ from app.config import settings
 
 logger = logging.getLogger(__name__)
 
+# Least privilege: permission to *send* mail as the user (not read it) + learn their address.
 SCOPES = [
     "https://www.googleapis.com/auth/gmail.send",
     "https://www.googleapis.com/auth/userinfo.email",
@@ -31,6 +32,7 @@ _USERINFO_URL = "https://www.googleapis.com/oauth2/v2/userinfo"
 
 
 def _client_config() -> dict:
+    """The OAuth client (this app) as registered in Google Cloud Console."""
     return {
         "web": {
             "client_id": settings.GOOGLE_OAUTH_CLIENT_ID,
@@ -65,6 +67,7 @@ def build_auth_url(state: str) -> str:
 
 
 def _fetch_token_sync(code: str) -> Credentials:
+    """Blocking HTTP call to Google: authorization code → access + refresh tokens."""
     flow = _make_flow()
     flow.fetch_token(code=code)
     return flow.credentials
@@ -72,7 +75,7 @@ def _fetch_token_sync(code: str) -> Credentials:
 
 async def exchange_code(code: str) -> tuple[str, str]:
     """Exchange an authorization code for (refresh_token, connected_email)."""
-    creds = await asyncio.to_thread(_fetch_token_sync, code)
+    creds = await asyncio.to_thread(_fetch_token_sync, code)  # Google's library is sync: run it off the event loop
     if not creds.refresh_token:
         raise RuntimeError(
             "Google did not return a refresh token — the user may need to revoke prior "
@@ -88,6 +91,7 @@ async def exchange_code(code: str) -> tuple[str, str]:
 
 
 def _build_raw_message(to_email: str, subject: str, plain: str, html: str) -> str:
+    """Plain-text + HTML email, base64url-encoded as the Gmail API expects."""
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
     msg["To"] = to_email
@@ -97,6 +101,7 @@ def _build_raw_message(to_email: str, subject: str, plain: str, html: str) -> st
 
 
 def _send_sync(refresh_token: str, to_email: str, subject: str, plain: str, html: str) -> None:
+    """Blocking: swap the long-lived refresh token for a short-lived access token, then send."""
     creds = Credentials(
         token=None,
         refresh_token=refresh_token,

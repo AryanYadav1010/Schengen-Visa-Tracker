@@ -360,6 +360,14 @@ async def test_telegram_is_sent_after_email_and_its_failure_does_not_undo_delive
     assert alert.status == AlertStatus.SENT and len(env.mailer.delivered) == 1
 
 
+async def test_deleting_a_watch_with_full_history_cascades(env):
+    await tick()   # successful check + delivered alert → snapshot, alert_logs and outbox rows
+    async with env.maker() as s:
+        await s.delete(await s.get(Watch, env.watch_id))
+        await s.commit()
+    assert await env.alert_log_count() == 0 and await env.outbox() == []
+
+
 async def test_deleting_a_watch_removes_its_outbox_history(env):
     env.mailer.failures = smtp_down()
     await tick()

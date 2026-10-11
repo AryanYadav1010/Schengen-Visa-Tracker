@@ -88,6 +88,8 @@ def test_watch_lifecycle_and_cutoff_clearing(client):
         "alert_before_date"] == "2026-12-01"
     assert client.patch(f"/api/watch/{watch_id}", json={"alert_before_date": ""}).json()["watch"][
         "alert_before_date"] is None
+    scrape = client.get(f"/debug/scrape?watch_id={watch_id}").json()   # owner, mock mode
+    assert scrape["scraper"].startswith("<MockScraper") and scrape["count"] == len(scrape["slots"]) > 0
     assert client.post(f"/api/watch/{watch_id}/toggle").json() == {"ok": True, "enabled": False}
     assert client.delete(f"/api/watch/{watch_id}").json() == {"ok": True}
 
@@ -122,3 +124,10 @@ def test_users_cannot_see_or_touch_each_others_watches(client):
 def test_http_client_request_urls_are_not_logged():
     # httpx logs full URLs at INFO; Telegram's contains the bot token.
     assert logging.getLogger("httpx").getEffectiveLevel() >= logging.WARNING
+
+
+def test_admin_match_is_case_insensitive(client, monkeypatch):
+    # Emails are stored lowercased; an ADMIN_EMAIL configured with capitals must still match.
+    monkeypatch.setattr(settings, "ADMIN_EMAIL", " Admin@Example.TEST ")
+    sign_in(client, "admin@example.test")
+    assert client.post("/debug/mock-mode", json={"mode": "normal"}).status_code == 200

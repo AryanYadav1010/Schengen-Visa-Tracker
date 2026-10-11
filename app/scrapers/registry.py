@@ -15,20 +15,15 @@ from app.scrapers.tlscontact_fr import TLScontactAgentScraper
 from app.scrapers.vfs_global import VFSGlobalAgentScraper
 from app.scrapers.bls_spain import BLSSpainAgentScraper
 
+# An exact (provider, centre, destination, visa_type) route, or ("provider", "*", "*", "*")
+# for "every route of this provider". Unlisted routes fail loudly in live mode.
 _REGISTRY: dict[tuple[str, str, str, str], Type[AbstractScraper]] = {
+    # TLScontact only for the routes it serves from London
     ("tlscontact", "London", "France", "tourism"): TLScontactAgentScraper,
     ("tlscontact", "London", "Germany", "tourism"): TLScontactAgentScraper,
-
-    # VFS Global mappings
-    ("vfs", "London", "Italy", "tourism"): VFSGlobalAgentScraper,
-    ("vfs", "London", "Portugal", "tourism"): VFSGlobalAgentScraper,
-    ("vfs", "London", "Netherlands", "tourism"): VFSGlobalAgentScraper,
-    ("vfs", "London", "Austria", "tourism"): VFSGlobalAgentScraper,
-    ("vfs", "London", "Greece", "tourism"): VFSGlobalAgentScraper,
+    # VFS Global (from London: Italy, Portugal, Netherlands, Austria, Greece, ...) and
+    # BLS International (Spain) use one adapter for every route
     ("vfs", "*", "*", "*"): VFSGlobalAgentScraper,
-
-    # BLS International mappings
-    ("bls", "London", "Spain", "tourism"): BLSSpainAgentScraper,
     ("bls", "*", "*", "*"): BLSSpainAgentScraper,
 }
 
@@ -46,7 +41,7 @@ def get_scraper(
 
     Falls back to MockScraper when USE_MOCK_SCRAPER=true (the default).
     """
-    if settings.USE_MOCK_SCRAPER:
+    if settings.USE_MOCK_SCRAPER:  # mock mode: every watch gets fake data, no network
         return MockScraper(
             centre=centre,
             destination=destination,
@@ -54,21 +49,9 @@ def get_scraper(
             booking_url=booking_url,
         )
 
-    # Try exact match first
-    key = (provider, centre, destination, visa_type)
-    cls = _REGISTRY.get(key)
-
-    # Try wildcard visa_type
-    if cls is None:
-        cls = _REGISTRY.get((provider, centre, destination, "*"))
-
-    # Try wildcard destination
-    if cls is None:
-        cls = _REGISTRY.get((provider, centre, "*", visa_type))
-
-    # Try provider-level wildcard
-    if cls is None:
-        cls = _REGISTRY.get((provider, "*", "*", "*"))
+    # Exact route first, then the provider-wide wildcard
+    cls = (_REGISTRY.get((provider, centre, destination, visa_type))
+           or _REGISTRY.get((provider, "*", "*", "*")))
 
     if cls is None:
         # No real scraper registered for this combo — fail loudly rather than
