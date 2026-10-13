@@ -118,7 +118,7 @@ docker run -d -p 8000:8000 `
   --name tracker schengen-tracker
 ```
 
-> Docker wasn't available to verify the build in this environment — run `docker build` yourself before relying on it for deployment.
+> The image is built and deployed with Fly.io's remote builder (`fly deploy --remote-only`); the same Dockerfile works with a local `docker build`.
 
 ## Architecture
 
@@ -226,7 +226,7 @@ It covers the HTTP API (authentication, per-user isolation, input validation), t
 `USE_MOCK_SCRAPER=true` is the safe default. Switching to `false` makes the scheduler drive a real AI agent (browser-use + Claude, real headless Chromium) against TLScontact, VFS Global, and BLS International. Before you do:
 
 - **You need real accounts and an Anthropic API key.** Each provider requires a registered account for the relevant centre/destination (entered per user in the dashboard, stored encrypted), and every check calls Claude (`ANTHROPIC_API_KEY`) to drive the browser — there's no free/local path for the real scrapers.
-- **This has never been run against the real sites.** The agent's task prompts (in `agent_scraper.py`) were written from documentation/inspection, not validated end-to-end against a real logged-in session — I don't have an Anthropic API key or your provider credentials in this environment, so the only validation done is unit tests with the agent mocked out. Run `GET /debug/scrape?watch_id=N` against **one** watch first, watch the logs, and read what the agent actually did before trusting the dashboard.
+- **This has never been run against the real sites.** The agent's task prompt (in `agent_scraper.py`) was written from documentation, not validated end-to-end against a real logged-in session; validation so far is unit tests with the agent mocked out. Run `GET /debug/scrape?watch_id=N` against **one** watch first, watch the logs, and read what the agent actually did before trusting the dashboard.
 - **Cost and latency are real, and scale with check frequency × watch count.** Each check is several Claude API calls (one per agent action — login, navigate, read calendar, etc.), not a free scripted run. With the default 15-minute interval and several watches enabled, this can add up quickly. Start with one watch, a longer interval, and check your Anthropic usage dashboard before enabling more.
 - **Built-in guardrails, but not a guarantee.** The agent has a hard step cap (`AGENT_MAX_STEPS`) and wall-clock timeout (`AGENT_TIMEOUT_SECONDS`) per check, is restricted to the target provider's domain (`allowed_domains`), is explicitly instructed to never solve a CAPTCHA and never proceed past viewing the calendar (no payment/booking/personal-data forms), and is told to treat all page content as untrusted data — not instructions — to resist prompt injection from a compromised or adversarial page. None of this is a hard technical sandbox; it's instruction-following plus hard numeric limits, same caveat as any LLM agent.
 - **Credentials are kept out of the agent's context.** `browser-use`'s `sensitive_data` mechanism substitutes your real email/password into form fields directly — the LLM only ever sees placeholder names (`x_username`/`x_password`), never the real values, so credentials can't leak into prompts or transcripts.
