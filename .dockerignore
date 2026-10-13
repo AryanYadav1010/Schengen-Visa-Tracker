@@ -11,3 +11,4 @@ data.db
 *.log
 .DS_Store
 docs/interview/
+review_only/

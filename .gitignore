@@ -13,3 +13,4 @@ data.db
 
 # Private, local-only notes — never published
 /docs/interview/
+/review_only/
