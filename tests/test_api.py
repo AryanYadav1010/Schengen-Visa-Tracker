@@ -13,6 +13,7 @@ import sqlite3
 import pytest
 from fastapi.testclient import TestClient
 
+from app.auth import _login_attempts
 from app.config import settings
 from app.main import app
 
@@ -27,6 +28,7 @@ def client():
 
 
 def sign_in(client, email, password="correct-horse-battery"):
+    _login_attempts.clear()  # many logins from one test IP; the limiter itself is tested in test_auth.py
     client.cookies.clear()
     r = client.post("/register", data={"email": email, "password": password}, follow_redirects=False)
     if r.status_code == 400:  # already registered by an earlier test
@@ -94,7 +96,8 @@ def test_watch_lifecycle_and_cutoff_clearing(client):
     assert client.delete(f"/api/watch/{watch_id}").json() == {"ok": True}
 
 
-def test_check_now_persists_snapshot_and_records_failed_delivery(client):
+def test_check_now_persists_snapshot_and_records_failed_delivery(client, monkeypatch):
+    monkeypatch.setattr(settings, "ADMIN_EMAIL", "carol@example.test")  # mock mode emails only the operator
     sign_in(client, "carol@example.test")
     watch_id = client.post("/api/watch", json=WATCH).json()["watch"]["id"]
 
@@ -104,6 +107,14 @@ def test_check_now_persists_snapshot_and_records_failed_delivery(client):
     assert db(f"SELECT is_error FROM availability_snapshots WHERE watch_id={watch_id}") == [(0,)]
     assert db(f"SELECT status, attempts, last_error FROM alert_outbox WHERE watch_id={watch_id}") == [
         ("pending", 1, "ConnectionRefusedError")]
+
+
+def test_mock_mode_test_email_is_operator_only(client, monkeypatch):
+    monkeypatch.setattr(settings, "ADMIN_EMAIL", "admin@example.test")
+    sign_in(client, "alice@example.test")
+    assert client.post("/api/test-email").status_code == 403
+    sign_in(client, "admin@example.test")
+    assert client.post("/api/test-email").status_code == 200  # attempted (SMTP closed in tests → ok: false)
 
 
 def test_users_cannot_see_or_touch_each_others_watches(client):

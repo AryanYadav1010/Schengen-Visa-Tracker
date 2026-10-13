@@ -220,9 +220,9 @@ async def _get_owned_watch(session, watch_id: int, user_id: int) -> Watch | None
 
 
 def _is_admin(user: User) -> bool:
-    """ADMIN_EMAIL may use the process-wide /debug/mock-mode switch. Emails are stored
-    lowercased at registration, so compare lowercased."""
-    return bool(settings.ADMIN_EMAIL) and user.email == settings.ADMIN_EMAIL.strip().lower()
+    """ADMIN_EMAIL may use the process-wide /debug/mock-mode switch (and, in mock mode, is
+    the only account that receives email)."""
+    return settings.is_admin_email(user.email)
 
 
 # ── Auth routes ──────────────────────────────────────────────
@@ -559,6 +559,10 @@ async def google_unlink(user: User = Depends(require_login)):
 @app.post("/api/test-email")
 async def test_email(user: User = Depends(require_login)):
     """Send a test email — via the user's connected Gmail if linked, else the operator's SMTP/Resend account."""
+    # Mock mode = demo: only the operator may make the server send email (registration is
+    # open and emails are unverified, so anyone else could aim it at any address).
+    if settings.USE_MOCK_SCRAPER and not _is_admin(user):
+        return JSONResponse({"ok": False, "message": "Email is disabled for this account in demo (mock) mode"}, 403)
     google_refresh_token = decrypt_credential(user.google_refresh_token) if user.google_refresh_token else None
     result = await notifier.send_test_email(user.email, google_refresh_token=google_refresh_token)
     return result

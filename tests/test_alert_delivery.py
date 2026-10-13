@@ -20,6 +20,7 @@ from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app import notifier, scheduler
+from app.config import settings
 from app.auth import encrypt_credential
 from app.models import AlertLog, AlertStatus, AvailabilitySnapshot, Base, OutboxAlert, User, Watch
 from app.scrapers.base import ScraperError, Slot
@@ -106,6 +107,8 @@ async def env(tmp_path, monkeypatch):
 
     monkeypatch.setattr(scheduler, "async_session", maker)
     monkeypatch.setattr(notifier, "async_session", maker)
+    # Tests run in mock mode, where only the operator (ADMIN_EMAIL) is ever emailed.
+    monkeypatch.setattr(settings, "ADMIN_EMAIL", "owner@example.test")
     monkeypatch.setattr(scheduler, "get_scraper", e.provider.get_scraper)
     monkeypatch.setattr(notifier, "_deliver_email", e.mailer)
     monkeypatch.setattr(notifier, "send_telegram_message", fake_telegram)
@@ -242,6 +245,23 @@ async def test_earlier_opening_supersedes_pending_alert_and_both_are_recorded(en
     old, new = await env.outbox()
     assert (old.earliest_date, old.status) == (OPENING, AlertStatus.SUPERSEDED)
     assert (new.earliest_date, new.status) == (EARLIER_OPENING, AlertStatus.SENT)
+
+
+# ── Mock mode: synthetic alerts reach only the operator ────────────────────
+
+async def test_mock_mode_never_emails_anyone_but_the_operator(env, monkeypatch):
+    monkeypatch.setattr(settings, "ADMIN_EMAIL", "operator@example.test")  # owner is someone else
+    await tick()
+    assert env.mailer.attempts == 0                      # not even attempted
+    [alert] = await env.outbox()                         # still recorded, with the reason
+    assert alert.status == AlertStatus.STALE and "mock mode" in alert.last_error
+
+
+async def test_live_mode_emails_every_owner(env, monkeypatch):
+    monkeypatch.setattr(settings, "USE_MOCK_SCRAPER", False)  # provider is still the fake
+    monkeypatch.setattr(settings, "ADMIN_EMAIL", "")
+    await tick()
+    assert env.mailer.delivered == ["owner@example.test"]
 
 
 # ── Revalidation before sending ─────────────────────────────────────────────

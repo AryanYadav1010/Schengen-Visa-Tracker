@@ -259,7 +259,16 @@ async def deliver_pending_alerts(watch_id: int | None = None) -> list[tuple[int,
 async def _stale_reason(session: AsyncSession, alert: OutboxAlert, now: datetime) -> str | None:
     """Revalidation policy: send only if the alert is young enough AND the latest *successful*
     check still lists availability on or before the alerted date. A failed check (error
-    snapshot) means "unknown", so it never makes an alert stale."""
+    snapshot) means "unknown", so it never makes an alert stale.
+
+    Mock mode: the slots are synthetic, so they're only ever emailed to the operator
+    (ADMIN_EMAIL). Every other user's alert is recorded as stale and never sent.
+    """
+    if settings.USE_MOCK_SCRAPER:
+        watch = await session.get(Watch, alert.watch_id)
+        owner = await session.get(User, watch.user_id)
+        if not settings.is_admin_email(owner.email):
+            return "mock mode: synthetic alerts are only emailed to the operator"
     if now - alert.detected_at > MAX_ALERT_AGE:
         return f"older than {MAX_ALERT_AGE}"
     latest = (await session.execute(

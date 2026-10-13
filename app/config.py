@@ -53,6 +53,10 @@ class Settings(BaseSettings):
     AGENT_MAX_STEPS: int = 30          # cost / runaway guard: max agent actions per check
     AGENT_TIMEOUT_SECONDS: int = 180   # hard wall-clock cap per check
 
+    def is_admin_email(self, email: str) -> bool:
+        """The operator account. Emails are stored lowercased, so compare lowercased."""
+        return bool(self.ADMIN_EMAIL) and email == self.ADMIN_EMAIL.strip().lower()
+
     @property
     def use_resend(self) -> bool:
         """Operator email goes through Resend when a key is set, otherwise SMTP."""
